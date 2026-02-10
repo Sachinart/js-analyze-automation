@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-EndpointHunter v4.0 — SPA Chunk-First Endpoint Discovery
-Strategy: Download ALL JS chunks → extract routes+params together → build complete URLs
-One unique URL per route+param structure (no duplicates)
+EndpointHunter v5.0 — Clean SPA Endpoint Discovery
+Fixes: No component names as routes, no Swiper params, strict filtering
+Strategy: Network intercept (ground truth) + filtered JS analysis + SPA route visiting
 """
 
 import asyncio
@@ -38,8 +38,8 @@ class C:
 def banner():
     print(f"""{C.CY}
  ╔═══════════════════════════════════════════════════════════════════╗
- ║  {C.BOLD}EndpointHunter v4.0{C.END}{C.CY} — Chunk-First SPA Endpoint Discovery    ║
- ║  ALL JS Chunks · Route+Param Pairing · Complete URL Builder      ║
+ ║  {C.BOLD}EndpointHunter v5.0{C.END}{C.CY} — Clean SPA Endpoint Discovery          ║
+ ║  No false routes · No noise params · Strict filtering            ║
  ╚═══════════════════════════════════════════════════════════════════╝{C.END}
 """)
 
@@ -62,32 +62,95 @@ class EndpointHunter:
         self.netloc = parsed.netloc
         self.base_domain = self._get_base_domain(parsed.netloc)
 
-        # Track ALL domains the site uses (CDN, API, etc.)
-        self.asset_domains = set()  # CDN domains serving JS chunks
+        self.asset_domains = set()
         self.asset_domains.add(self.netloc)
 
         # JS
         self.js_urls = set()
-        self.js_content = {}       # url -> content
+        self.js_content = {}
         self.analyzed_js = set()
 
-        # Network intercept
+        # Network intercept (ground truth)
         self.intercepted = []
         self.api_log_seen = {}
 
         # Discovered data
-        self.raw_routes = set()           # /path only
-        self.raw_api_endpoints = set()    # /api/... paths
-        self.route_param_pairs = []       # [{route, params, method, context}]
-        self.query_param_names = set()    # all param names found globally
+        self.valid_routes = set()          # confirmed real routes
+        self.api_endpoints = []            # [{path, method, params, body_params, source}]
+        self.route_with_params = []        # [{route, params}]
 
-        # Final output — ONE url per structural signature
+        # Final
         self.get_endpoints = OrderedDict()
         self.post_endpoints = OrderedDict()
         self.other_endpoints = OrderedDict()
 
         self.secrets = []
         self.output_dir = self._create_output_dir()
+
+        # ── Route validation: what makes a REAL route vs a component name ──
+        # PascalCase = component name (CommonCashierPop, DefaultMessageCard)
+        # Real routes: /all, /detail/helpCenter, /vip, /game/slot
+        self._component_pattern = re.compile(r'^/[A-Z][a-zA-Z]+(?:[A-Z][a-zA-Z]+){1,}$')
+
+        # Param names that are clearly NOT URL query params (library configs)
+        self._junk_params = {
+            # Swiper.js
+            'slidesPerView', 'spaceBetween', 'grabCursor', 'centeredSlides', 'autoplay',
+            'pagination', 'navigation', 'scrollbar', 'freeMode', 'freeModeSticky',
+            'watchSlidesProgress', 'watchSlidesVisibility', 'loop', 'preloadImages',
+            'observer', 'observeParents', 'breakpoints', 'effect', 'coverflowEffect',
+            'cubeEffect', 'flipEffect', 'fadeEffect', 'creativeEffect', 'cardsEffect',
+            'virtualTranslate', 'slideClass', 'wrapperClass', 'containerClass',
+            'slideActiveClass', 'slideDuplicateClass', 'loadedClass', 'loadingClass',
+            'preloaderClass', 'lazyPreloaderClass', 'hiddenClass', 'lockClass',
+            'disabledClass', 'dragClass', 'notificationClass', 'thumbsContainerClass',
+            'zoomedSlideClass', 'containerModifierClass', 'slideThumbActiveClass',
+            'slidesPerColumn', 'slidesPerGroup', 'slidesPerGroupSkip', 'slidesOffsetBefore',
+            'allowTouchMove', 'allowSlideNext', 'allowSlidePrev', 'simulateTouch',
+            'threshold', 'touchEventsTarget', 'touchReleaseOnEdges', 'preventClicks',
+            'preventClicksPropagation', 'passiveListeners', 'mousewheel', 'keyboard',
+            'resizeObserver', 'runCallbacksOnInit', 'watchOverflow', 'cssMode',
+            'autoHeight', 'nested', 'rewind', 'speed', 'initialSlide', 'direction',
+            'uniqueNavElements', 'parallax', 'a11y', 'lazy', 'virtual', 'thumbs',
+            'controller', 'hashNavigation', 'history', 'grid', 'zoom', 'dynamicBullets',
+            'dynamicMainBullets', 'formatFractionCurrent', 'renderFraction', 'renderBullet',
+            'renderProgressbar', 'renderCustom', 'renderExternal', 'renderSlide',
+            'bulletElement', 'firstSlideMessage', 'lastSlideMessage', 'nextSlideMessage',
+            'prevSlideMessage', 'paginationType', 'clickable', 'hideOnClick',
+            'progressbarOpposite', 'crossFade', 'shadow', 'shadowScale', 'shadowOffset',
+            'slideShadows', 'limitRotation', 'rotate', 'stretch', 'depth', 'modifier',
+            'minRatio', 'maxRatio', 'loadPrevNext', 'loadPrevNextAmount', 'swiper',
+            'focusableElements', 'eventsTarged', 'eventsPrefix', 'swiperElementNodeName',
+            'invert', 'forceToAxis', 'releaseOnEdges', 'sensitivity', 'draggable',
+            'snapOnRelease', 'dragSize', 'onlyInViewport', 'waitForTransition',
+            'stopOnLastSlide', 'reverseDirection', 'disableOnInteraction',
+            'autoplayDisableOnInteraction', 'loadOnTransitionStart',
+            'breakpointsInverse', 'updateOnImagesReady', 'addSlidesBefore',
+            'addSlidesAfter', 'inverse', 'dryRun', 'prevEl', 'nextEl', 'enabled',
+            'containerModif', 'containerModifierClas',
+            # Generic JS / Vue internals
+            'render', 'init', 'on', 'push', 'join', 'hide', 'toggle', 'cache',
+            'sync', 'el', 'key', 'data', 'error', 'body', 'text', 'title', 'header',
+            'height', 'width', 'delay', 'mode', 'scope', 'state', 'event', 'slides',
+            'control', 'embed', 'nav', 'tabs', 'onload', 'onAny', '_emitClasses',
+            'replaceState', 'createElements', '_construct', 'hasOwnProperty',
+            'currentRoute', 'fullpath', 'path', 'name',  # router internals
+            # Short var names from minification
+            'e', 'i', 'u', 'v', 'p', 's', 'C', 'K', '_',
+            'at', 'bt', 'ct', 'dt', 'et', 'ft', 'gt', 'ht', 'it', 'kt', 'lt',
+            'mt', 'nt', 'st', 'ut', 'vt', 'wt', 'xt', 'yt',
+            'Be', 'Ce', 'De', 'Fe', 'Ge', 'He', 'Ie', 'Je', 'Ke', 'Me', 'Ne',
+            'Oe', 'Qe', 'Re', 'Ue', 'Ve', 'We', 'Xe', 'Ye', 'Ze',
+            'Ct', 'Dt', 'Ft', 'Gt', 'Ht', 'Mt', 'Nt', 'Ut', 'Wt',
+            'ce', 'je', 'lr', 'qe', 'qu', 'ze',
+            # Other non-URL stuff
+            'version', 'brand', 'runtimeLocale', 'locale', 'language',
+            'isShow', 'isPcHorizontal', 'isCS', 'isCs', 'isMyChat',
+            'showReset', 'watchState', 'by', 'icons',
+            'openBindPhone', 'openBindEmail', 'openBindFunds', 'openFundsPassword',
+            'setOrChange', 'currentSize', 'tipData', 'continuation', 'continuationToken',
+            'ginationBulletMessage',
+        }
 
         self.secret_patterns = {
             'API Key': [r'(?i)(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([a-zA-Z0-9_\-]{16,})["\']'],
@@ -105,20 +168,9 @@ class EndpointHunter:
         parts = netloc.split(".")
         return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
 
-    def _is_target_scope(self, url):
-        """Is this URL on the target domain (for endpoints)?"""
-        try:
-            return urlparse(url).netloc == self.netloc
-        except:
-            return False
-
-    def _is_asset_scope(self, url):
-        """Is this URL on a known asset/CDN domain (for JS files)?"""
-        try:
-            netloc = urlparse(url).netloc
-            return netloc in self.asset_domains or netloc == self.netloc
-        except:
-            return False
+    def _is_target(self, url):
+        try: return urlparse(url).netloc == self.netloc
+        except: return False
 
     def _create_output_dir(self):
         domain = self.netloc.replace("www.", "")
@@ -130,20 +182,13 @@ class EndpointHunter:
         return d
 
     def _sig(self, method, path, param_keys):
-        """Structural signature for dedup: method + path_template + sorted_param_keys"""
-        # Normalize path: replace numeric segments with {N}
         parts = path.split("/")
         norm = []
         for p in parts:
-            if re.match(r'^\d+$', p):
-                norm.append("{N}")
-            elif re.match(r'^[a-f0-9]{8,}$', p, re.I):
-                norm.append("{H}")
-            else:
-                norm.append(p)
-        norm_path = "/".join(norm)
-        keys = ",".join(sorted(param_keys)) if param_keys else ""
-        return f"{method}|{norm_path}|{keys}"
+            if re.match(r'^\d+$', p): norm.append("{N}")
+            elif re.match(r'^[a-f0-9]{8,}$', p, re.I): norm.append("{H}")
+            else: norm.append(p)
+        return f"{method}|{'/' .join(norm)}|{','.join(sorted(param_keys))}"
 
     def _log(self, msg, level="info"):
         colors = {"info": C.CY, "ok": C.G, "warn": C.Y, "err": C.R, "dim": C.DIM}
@@ -153,68 +198,152 @@ class EndpointHunter:
         if self.verbose:
             print(f"    {C.DIM}{msg}{C.END}")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROUTE VALIDATION — the core fix
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _is_valid_route(self, path):
+        """Strict validation: is this a real URL route or a component/class name?"""
+        if not path or len(path) < 2 or not path.startswith('/'):
+            return False
+
+        # Skip static files
+        if any(path.lower().endswith(ext) for ext in
+               ('.js', '.css', '.png', '.jpg', '.gif', '.svg', '.ico', '.json',
+                '.map', '.woff', '.woff2', '.ttf', '.webp', '.xml', '.txt')):
+            return False
+
+        # Skip internal framework paths
+        if any(seg in path for seg in ('_nuxt', '__nuxt', 'node_modules', 'assets/', 'static/')):
+            return False
+
+        # ── THE KEY FILTER: reject PascalCase component names ──
+        # Component names: /CommonCashierPopDepositFiatCurrencyTab
+        # Real routes: /all, /detail/helpCenter, /vip, /game/slot, /roulette
+        segments = path.strip('/').split('/')
+        for seg in segments:
+            if not seg:
+                continue
+            # PascalCase with 2+ capital words = component name
+            # e.g. "CommonCashierPop", "DefaultMessageCard", "BonusWalletPage"
+            capitals = re.findall(r'[A-Z]', seg)
+            if len(capitals) >= 2 and seg[0].isupper():
+                # Check if it looks like a real route (some routes can have camelCase)
+                # Real: "helpCenter" (1 capital mid-word), "IsNew" (short param value)
+                # Fake: "CommonCashierPopDepositFiatCurrencyTab" (many capitals, long)
+                if len(capitals) >= 3 and len(seg) > 15:
+                    return False
+                # Also reject if it starts with common component prefixes
+                component_prefixes = (
+                    'Common', 'Default', 'Base', 'App', 'Layout', 'Modal', 'Popup',
+                    'Dialog', 'Drawer', 'Panel', 'Card', 'Block', 'Widget', 'Wrapper',
+                    'Container', 'Provider', 'Controller', 'Manager', 'Handler',
+                    'Renderer', 'Factory', 'Service', 'Store', 'Mixin', 'Plugin',
+                    'Directive', 'Filter', 'Guard', 'Interceptor', 'Resolver',
+                    'Validator', 'Formatter', 'Adapter', 'Bridge', 'Proxy',
+                )
+                if any(seg.startswith(prefix) for prefix in component_prefixes):
+                    return False
+
+            # Reject single uppercase words that are clearly class names
+            # e.g. "ActivateWallet", "BonusOverview", "CryptoGame"
+            if seg[0].isupper() and len(capitals) >= 2 and len(seg) > 10:
+                return False
+
+        # Length sanity
+        if len(path) > 100:
+            return False
+
+        return True
+
+    def _is_valid_param(self, name):
+        """Is this a real URL query parameter or library config noise?"""
+        if not name or len(name) < 2 or len(name) > 30:
+            return False
+        if name in self._junk_params:
+            return False
+        # Reject minified var names (1-2 chars, or XY pattern)
+        if len(name) <= 2:
+            return False
+        if re.match(r'^[A-Z][a-z]$', name):  # Xe, Be, etc.
+            return False
+        # Reject camelCase with 3+ capitals (likely config object)
+        capitals = len(re.findall(r'[A-Z]', name))
+        if capitals >= 3 and len(name) > 12:
+            return False
+        return True
+
+    def _guess_val(self, name):
+        n = name.lower()
+        if n in ('id', 'uid', 'gid', 'pid'): return '1'
+        if n == 'page': return '1'
+        if n == 'type': return 'IsNew'
+        if n == 'name': return 'test'
+        if n in ('limit', 'size', 'pagesize', 'per_page'): return '20'
+        if n == 'sort': return 'new'
+        if n in ('status', 'state'): return 'active'
+        if n in ('lang',): return 'en'
+        if n in ('category', 'cat'): return 'all'
+        if n == 'tab': return '1'
+        if n in ('keyword', 'search', 'q'): return 'test'
+        if n == 'gametype': return 'slot'
+        if n == 'origin': return 'web'
+        if n == 'platform': return 'pc'
+        if n == 'symbol': return 'USDT'
+        if n == 'currency': return 'USD'
+        if n == 'channel': return '1'
+        if 'id' in n: return '1'
+        if 'page' in n: return '1'
+        if 'num' in n or 'count' in n: return '10'
+        if 'date' in n: return '2024-01-01'
+        if 'url' in n: return 'https://example.com'
+        if 'token' in n: return 'TOKEN'
+        return 'test'
+
     # ── Network Interception ─────────────────────────────────────────────────
 
     def _on_request(self, request):
         url = request.url
-        if not url.startswith("http"):
+        if not url.startswith("http") or not self._is_target(url):
             return
 
         parsed = urlparse(url)
-
-        # Detect CDN domains serving JS/assets for this site
-        if parsed.path.endswith('.js') and ('_nuxt' in url or 'chunk' in url or 'assets' in url):
-            self.asset_domains.add(parsed.netloc)
-            clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
-            self.js_urls.add(clean)
-            return
-
-        # Only record endpoints on the TARGET domain
-        if not self._is_target_scope(url):
-            return
-
-        # Skip static
         skip_ext = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff',
-                    '.woff2', '.ttf', '.eot', '.mp4', '.mp3', '.webp', '.css', '.map')
+                    '.woff2', '.ttf', '.eot', '.mp4', '.webp', '.css', '.map')
         if any(parsed.path.lower().endswith(ext) for ext in skip_ext):
             return
 
-        # Also record JS on target domain
         if parsed.path.endswith('.js'):
             self.js_urls.add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')))
             return
 
-        # Safe post_data
         post_data = None
         try:
             post_data = request.post_data
-        except Exception:
+        except:
             try:
                 raw = request.post_data_buffer
                 post_data = f"<binary:{len(raw)}b>" if raw else None
             except:
                 pass
 
-        method = request.method.upper()
         self.intercepted.append({
-            'url': url, 'method': method, 'post_data': post_data,
-            'path': parsed.path, 'query': parsed.query,
+            'url': url, 'method': request.method.upper(),
+            'post_data': post_data, 'path': parsed.path, 'query': parsed.query,
         })
 
     def _on_response(self, response):
         try:
             url = response.url
-            if not self._is_target_scope(url):
+            if not self._is_target(url):
                 return
             ct = response.headers.get('content-type', '')
             if 'application/json' not in ct:
                 return
-
             method = response.request.method.upper()
             parsed = urlparse(url)
             pkeys = ",".join(sorted(parse_qs(parsed.query).keys()))
             dedup = f"{method}:{parsed.path}:{pkeys}"
-
             count = self.api_log_seen.get(dedup, 0)
             self.api_log_seen[dedup] = count + 1
             if count < 2:
@@ -224,53 +353,56 @@ class EndpointHunter:
         except:
             pass
 
-    # ── Phase 1: Load page, intercept traffic, discover CDN domain ───────────
+    # Also intercept JS from CDN domains
+    def _on_request_js(self, request):
+        """Separate handler just for discovering JS files on CDN"""
+        url = request.url
+        if not url.startswith("http"):
+            return
+        parsed = urlparse(url)
+        if parsed.path.endswith('.js') and ('_nuxt' in url or 'chunk' in url or 'assets' in url):
+            self.asset_domains.add(parsed.netloc)
+            self.js_urls.add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')))
 
-    async def _phase1_load_and_intercept(self, page):
-        """Load the target, interact heavily, capture all network + discover CDN"""
-        print(f"\n  {C.BOLD}{C.Y}═══ Phase 1: Load Target + Intercept Traffic ═══{C.END}\n")
+    # ── Phase 1: Load + Interact ─────────────────────────────────────────────
+
+    async def _phase1(self, page):
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 1: Load + Interact + Intercept ═══{C.END}\n")
 
         try:
             await page.goto(self.target_url, wait_until='domcontentloaded', timeout=self.timeout * 1000)
-            try:
-                await page.wait_for_load_state('networkidle', timeout=15000)
-            except:
-                pass
+            try: await page.wait_for_load_state('networkidle', timeout=15000)
+            except: pass
             await page.wait_for_timeout(3000)
         except Exception as e:
             self._log(f"Load error: {e}", "err")
 
-        # ── Discover the CDN domain from <script> tags and <link> tags ──
+        # Discover CDN from script tags
         try:
             srcs = await page.evaluate('''() => {
-                const urls = [];
-                document.querySelectorAll('script[src]').forEach(s => urls.push(s.src));
-                document.querySelectorAll('link[href]').forEach(l => urls.push(l.href));
-                return urls;
+                return Array.from(document.querySelectorAll('script[src]')).map(s => s.src);
             }''')
             for src in srcs:
-                parsed = urlparse(src)
-                if parsed.path.endswith('.js'):
-                    self.asset_domains.add(parsed.netloc)
-                    self.js_urls.add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')))
-        except:
-            pass
+                p = urlparse(src)
+                if p.path.endswith('.js'):
+                    self.asset_domains.add(p.netloc)
+                    self.js_urls.add(urlunparse((p.scheme, p.netloc, p.path, '', '', '')))
+        except: pass
 
-        self._log(f"Asset domains detected: {self.asset_domains}", "ok")
-        self._log(f"JS files found: {len(self.js_urls)}", "ok")
+        self._log(f"CDN domains: {self.asset_domains}", "ok")
 
-        # ── Heavy interaction to trigger API calls ──
-        self._log("Interacting with page (scroll, click tabs/nav/filters)...")
+        # Interact
+        self._log("Interacting (scroll + click)...")
         await self._interact(page)
 
-        # ── Extract all links from DOM ──
-        await self._extract_dom_links(page)
+        # Extract real links from DOM
+        await self._extract_dom_routes(page)
 
-        self._log(f"Network requests captured: {len(self.intercepted)}", "ok")
-        self._log(f"Routes found from DOM: {len(self.raw_routes)}", "ok")
+        self._log(f"Intercepted: {len(self.intercepted)} requests", "ok")
+        self._log(f"Valid routes from DOM: {len(self.valid_routes)}", "ok")
+        self._log(f"JS files found: {len(self.js_urls)}", "ok")
 
     async def _interact(self, page):
-        """Click everything interactive to trigger API calls"""
         try:
             # Scroll
             await page.evaluate('''async () => {
@@ -282,16 +414,13 @@ class EndpointHunter:
             }''')
             await page.wait_for_timeout(1000)
 
-            # Click selectors
             selectors = [
                 'nav a', '.nav a', '.nav-item', '.nav-link', 'header a',
-                '.sidebar a', '[role="tab"]', '.tab', '.tab-item',
-                '[class*="tab"]', '[class*="filter"]', '[class*="category"]',
-                '[class*="menu"] a', '[class*="nav"] a',
-                'button[data-type]', '[data-category]', '[class*="sort"]',
-                '.pagination a', '.pagination button', '[class*="page"] a',
-                'a[href*="page="]', '[class*="next"]', '[class*="more"]',
-                'footer a', '.game-item a', '.card a', '[class*="card"] a',
+                '[role="tab"]', '.tab', '.tab-item', '[class*="tab"]',
+                '[class*="filter"]', '[class*="category"]', '[class*="menu"] a',
+                'button[data-type]', '[data-category]',
+                '.pagination a', 'a[href*="page="]', '[class*="next"]', '[class*="more"]',
+                'footer a', '.card a', '[class*="game"] a',
             ]
 
             clicked = set()
@@ -302,91 +431,74 @@ class EndpointHunter:
                         try:
                             ident = await page.evaluate(
                                 '(el) => (el.getAttribute("href")||"") + "|" + (el.textContent||"").trim().slice(0,20)', el)
-                            if ident in clicked:
-                                continue
+                            if ident in clicked: continue
                             clicked.add(ident)
-                            if not await el.is_visible():
-                                continue
+                            if not await el.is_visible(): continue
 
-                            # Capture href/to as route
                             href = await page.evaluate(
                                 '(el) => el.getAttribute("href") || el.getAttribute("to") || ""', el)
-                            if href and href.startswith('/') and not href.endswith(('.js', '.css', '.png')):
-                                self.raw_routes.add(href)
+                            if href and href.startswith('/') and self._is_valid_route(href):
+                                self.valid_routes.add(href.split('?')[0])
 
                             await el.click(timeout=2500)
                             await page.wait_for_timeout(600)
 
-                            # Record URL after SPA navigation
                             cur = page.url
-                            if self._is_target_scope(cur):
+                            if self._is_target(cur):
                                 p = urlparse(cur)
-                                route = p.path + ('?' + p.query if p.query else '')
-                                self.raw_routes.add(route)
-                        except:
-                            pass
-                except:
-                    pass
-        except Exception as e:
-            self._vlog(f"Interact error: {e}")
+                                route = p.path
+                                if self._is_valid_route(route):
+                                    self.valid_routes.add(route)
+                                    if p.query:
+                                        self.route_with_params.append({
+                                            'route': route,
+                                            'params': dict(parse_qs(p.query, keep_blank_values=True)),
+                                        })
+                        except: pass
+                except: pass
+        except: pass
 
-    async def _extract_dom_links(self, page):
-        """Extract all link-like things from DOM"""
+    async def _extract_dom_routes(self, page):
         try:
             results = await page.evaluate('''() => {
-                const links = new Set();
-                // <a href>, <a to> (Vue/Nuxt)
+                const links = [];
                 document.querySelectorAll('a[href], [to]').forEach(el => {
                     const v = el.getAttribute('href') || el.getAttribute('to') || '';
-                    if (v.startsWith('/') || v.startsWith('http')) links.add(v);
+                    if (v.startsWith('/')) links.push(v);
+                    if (v.startsWith('http')) links.push(v);
                 });
-                // data attributes
-                document.querySelectorAll('[data-href],[data-url],[data-to],[data-path],[data-link]').forEach(el => {
-                    for (const attr of ['data-href','data-url','data-to','data-path','data-link']) {
-                        const v = el.getAttribute(attr);
-                        if (v && (v.startsWith('/') || v.startsWith('http'))) links.add(v);
+                document.querySelectorAll('[data-href],[data-url],[data-to]').forEach(el => {
+                    for (const a of ['data-href','data-url','data-to']) {
+                        const v = el.getAttribute(a);
+                        if (v) links.push(v);
                     }
                 });
-                // inline scripts
-                document.querySelectorAll('script:not([src])').forEach(s => {
-                    const t = s.textContent || '';
-                    const ms = t.match(/["']\\/[a-zA-Z][^"'\\s]{1,120}["']/g);
-                    if (ms) ms.forEach(m => links.add(m.replace(/["']/g, '')));
-                });
-                return Array.from(links);
+                return links;
             }''')
-
             for link in results:
                 if link.startswith('/'):
-                    if not any(link.endswith(ext) for ext in ('.js', '.css', '.png', '.svg', '.ico', '.json')):
-                        self.raw_routes.add(link)
-                elif link.startswith('http') and self._is_target_scope(link):
+                    path = link.split('?')[0]
+                    if self._is_valid_route(path):
+                        self.valid_routes.add(path)
+                elif link.startswith('http') and self._is_target(link):
                     p = urlparse(link)
-                    route = p.path + ('?' + p.query if p.query else '')
-                    if not any(route.endswith(ext) for ext in ('.js', '.css', '.png', '.svg', '.ico')):
-                        self.raw_routes.add(route)
-        except Exception as e:
-            self._vlog(f"DOM link error: {e}")
+                    if self._is_valid_route(p.path):
+                        self.valid_routes.add(p.path)
+        except: pass
 
-    # ── Phase 2: Download ALL JS chunks (including CDN) ──────────────────────
+    # ── Phase 2: Download ALL JS ─────────────────────────────────────────────
 
-    async def _phase2_download_all_js(self, page):
-        """Download every JS file — from target AND CDN domains"""
+    async def _phase2(self, page):
         print(f"\n  {C.BOLD}{C.Y}═══ Phase 2: Download ALL JS Chunks ═══{C.END}\n")
 
-        # First, try to get the Nuxt build manifest to find ALL chunks
         await self._discover_nuxt_chunks(page)
+        self._log(f"JS files to download: {len(self.js_urls)}", "info")
 
-        self._log(f"Total JS files to download: {len(self.js_urls)}", "info")
-
-        # Download in passes (JS files can reference more JS files)
         for pass_num in range(1, 6):
             to_dl = [u for u in self.js_urls if u not in self.js_content]
-            if not to_dl:
-                break
+            if not to_dl: break
 
-            self._log(f"Pass {pass_num}: downloading {len(to_dl)} JS files...", "warn")
-
+            self._log(f"Pass {pass_num}: downloading {len(to_dl)} files...", "warn")
             for i, url in enumerate(sorted(to_dl), 1):
                 try:
                     resp = await page.goto(url, wait_until='load', timeout=12000)
@@ -394,339 +506,206 @@ class EndpointHunter:
                         content = await resp.text()
                         if content and len(content) > 10:
                             self.js_content[url] = content
-
-                            # Save
                             fname = re.sub(r'[^\w\-.]', '_', url.split('/')[-1])[:120]
                             with open(os.path.join(self.output_dir, "js_files", fname), 'w',
                                       encoding='utf-8', errors='ignore') as f:
                                 f.write(content)
-
-                            # Find more JS refs inside this file
                             self._find_js_refs(url, content)
+                            if self.verbose and i % 20 == 0:
+                                print(f"    {C.DIM}[{i}/{len(to_dl)}]{C.END}")
+                except: pass
 
-                            if self.verbose and i % 10 == 0:
-                                print(f"    {C.DIM}[{i}/{len(to_dl)}] downloaded...{C.END}")
-                except:
-                    pass
+            remaining = len([u for u in self.js_urls if u not in self.js_content])
+            self._log(f"Pass {pass_num}: cached {len(self.js_content)}, remaining {remaining}", "ok")
+            if remaining == 0: break
 
-            new_count = len([u for u in self.js_urls if u not in self.js_content])
-            self._log(f"Pass {pass_num} done. Cached: {len(self.js_content)}. Remaining: {new_count}", "ok")
-            if new_count == 0:
-                break
-
-        self._log(f"Total JS downloaded: {len(self.js_content)}/{len(self.js_urls)}", "ok")
+        self._log(f"Total: {len(self.js_content)}/{len(self.js_urls)} JS downloaded", "ok")
 
     async def _discover_nuxt_chunks(self, page):
-        """Parse Nuxt build manifest to find ALL JS chunk URLs"""
-        # The CDN domain is where _nuxt lives
         cdn_origins = set()
-        for domain in self.asset_domains:
-            for scheme in ['https']:
-                cdn_origins.add(f"{scheme}://{domain}")
+        for d in self.asset_domains:
+            cdn_origins.add(f"https://{d}")
 
-        # Try manifest endpoints
-        manifest_paths = [
-            '/_nuxt/builds/latest.json',
-            '/_payload.json',
-        ]
-
-        # Also check intercepted requests for build meta URLs
+        # From intercepted requests
         for req in self.intercepted:
-            if '_nuxt/builds/meta' in req['url']:
+            if '_nuxt' in req['url'] and req['url'].endswith('.json'):
                 try:
                     resp = await page.goto(req['url'], wait_until='load', timeout=8000)
                     if resp and resp.status == 200:
-                        text = await resp.text()
-                        self._extract_chunk_urls_from_json(text, req['url'])
-                except:
-                    pass
+                        self._extract_chunk_urls(await resp.text(), req['url'])
+                except: pass
 
-        # Check the Nuxt build meta from all known CDN domains too
-        for req_data in list(self.intercepted):
-            url = req_data['url']
-            if '_nuxt' in url and url.endswith('.json'):
+        for origin in cdn_origins:
+            for path in ['/_nuxt/builds/latest.json']:
                 try:
-                    resp = await page.goto(url, wait_until='load', timeout=8000)
+                    resp = await page.goto(origin + path, wait_until='load', timeout=8000)
                     if resp and resp.status == 200:
-                        text = await resp.text()
-                        self._extract_chunk_urls_from_json(text, url)
-                except:
-                    pass
+                        self._extract_chunk_urls(await resp.text(), origin + path)
+                except: pass
 
-        for cdn_origin in cdn_origins:
-            for path in manifest_paths:
-                try:
-                    url = cdn_origin + path
-                    resp = await page.goto(url, wait_until='load', timeout=8000)
-                    if resp and resp.status == 200:
-                        text = await resp.text()
-                        self._extract_chunk_urls_from_json(text, url)
-                        self._vlog(f"Found manifest: {url}")
-                except:
-                    pass
-
-        # Brute-find JS chunk patterns from HTML source
+        # From HTML
         try:
             await page.goto(self.target_url, wait_until='domcontentloaded', timeout=15000)
             html = await page.content()
-            # Find all JS references in HTML
-            for m in re.finditer(r'(?:src|href)\s*=\s*["\']((?:https?://)?[^"\']*\.js(?:\?[^"\']*)?)["\']', html):
-                js_ref = m.group(1)
-                if js_ref.startswith('//'):
-                    js_ref = 'https:' + js_ref
-                elif js_ref.startswith('/'):
-                    # Could be on any CDN origin
+            for m in re.finditer(r'(?:src|href)\s*=\s*["\']((?:https?://)?[^"\']*\.js)["\']', html):
+                ref = m.group(1)
+                if ref.startswith('//'): ref = 'https:' + ref
+                elif ref.startswith('/'):
                     for cdn in cdn_origins:
-                        self.js_urls.add(cdn + js_ref.split('?')[0])
-                    self.js_urls.add(self.origin + js_ref.split('?')[0])
-                elif js_ref.startswith('http'):
-                    self.js_urls.add(js_ref.split('?')[0])
-        except:
-            pass
+                        self.js_urls.add(cdn + ref.split('?')[0])
+                elif ref.startswith('http'):
+                    self.js_urls.add(ref.split('?')[0])
+        except: pass
 
-        self._log(f"After manifest scan: {len(self.js_urls)} JS files known", "ok")
-
-    def _extract_chunk_urls_from_json(self, text, base_url):
-        """Extract JS chunk URLs from Nuxt manifest JSON"""
-        parsed_base = urlparse(base_url)
-        base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
-
-        # Find all .js references
+    def _extract_chunk_urls(self, text, base_url):
+        base_origin = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
         for m in re.finditer(r'["\']([^"\']*\.(?:js|mjs))["\']', text):
             ref = m.group(1)
             if ref.startswith('http'):
                 self.js_urls.add(ref.split('?')[0])
             elif ref.startswith('/'):
-                self.js_urls.add(base_origin + ref.split('?')[0])
-            elif ref.startswith('./') or not ref.startswith('.'):
-                # Relative to base
+                self.js_urls.add(base_origin + ref)
+            else:
                 base_dir = '/'.join(base_url.split('/')[:-1])
-                full = base_dir + '/' + ref.lstrip('./')
-                self.js_urls.add(full.split('?')[0])
+                self.js_urls.add(f"{base_dir}/{ref.lstrip('./')}".split('?')[0])
 
     def _find_js_refs(self, base_url, content):
-        """Find references to other JS files within JS content"""
-        parsed_base = urlparse(base_url)
-        base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
-
-        patterns = [
-            r'import\s*\(\s*["\']([^"\']+\.js)["\']',
-            r'import\s+.*?\s+from\s+["\']([^"\']+\.js)["\']',
+        base_origin = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+        for pat in [
             r'["\']([^"\']*?[a-zA-Z0-9_\-]+\.[a-f0-9]{6,}\.js)["\']',
             r'["\']([^"\']*?_nuxt/[^\s"\']*\.js)["\']',
-            r'["\']([^"\']*?assets/[^\s"\']*\.js)["\']',
             r'["\'](/[a-zA-Z0-9_\-/.]+\.js)["\']',
-            # Webpack/Vite chunk patterns
-            r'["\']((?:\./|\.\./)[\w\-/]+\.js)["\']',
             r'["\']([a-zA-Z0-9_\-]+\.[a-f0-9]{6,8}\.js)["\']',
-        ]
-
-        for pat in patterns:
+        ]:
             for m in re.finditer(pat, content):
                 ref = m.group(1)
                 if ref.startswith('http'):
-                    p = urlparse(ref)
-                    if p.netloc in self.asset_domains:
+                    if urlparse(ref).netloc in self.asset_domains:
                         self.js_urls.add(ref.split('?')[0])
                 elif ref.startswith('/'):
                     self.js_urls.add(base_origin + ref)
                 else:
                     base_dir = '/'.join(base_url.split('/')[:-1])
-                    full = base_dir + '/' + ref.lstrip('./')
-                    self.js_urls.add(full.split('?')[0])
+                    self.js_urls.add(f"{base_dir}/{ref.lstrip('./')}".split('?')[0])
 
-    # ── Phase 3: Analyze ALL JS — extract routes + params TOGETHER ───────────
+    # ── Phase 3: Analyze JS — with STRICT filtering ──────────────────────────
 
-    def _phase3_analyze_js(self):
-        """The core: analyze every JS file, extract route+param pairs"""
-        print(f"\n  {C.BOLD}{C.Y}═══ Phase 3: Deep JS Analysis (Routes + Params) ═══{C.END}\n")
+    def _phase3(self):
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 3: JS Analysis (strict filtering) ═══{C.END}\n")
 
         total_routes = 0
         total_apis = 0
 
         for url, content in self.js_content.items():
-            if url in self.analyzed_js:
-                continue
+            if url in self.analyzed_js: continue
             self.analyzed_js.add(url)
 
-            # Optionally beautify
             if HAS_BEAUTIFIER and len(content) < 2_000_000:
                 try:
                     opts = jsbeautifier.default_options()
                     opts.indent_size = 2
                     content = jsbeautifier.beautify(content, opts)
-                except:
-                    pass
+                except: pass
 
-            r, a = self._analyze_single_js(url, content)
+            r, a = self._analyze_js(url, content)
             total_routes += r
             total_apis += a
 
-        self._log(f"Routes extracted: {total_routes}", "ok")
-        self._log(f"API endpoints extracted: {total_apis}", "ok")
-        self._log(f"Query param names found: {self.query_param_names}", "ok")
+        self._log(f"Valid routes from JS: {total_routes}", "ok")
+        self._log(f"API endpoints from JS: {total_apis}", "ok")
+        self._log(f"Total valid routes: {len(self.valid_routes)}", "ok")
 
-    def _analyze_single_js(self, url, content):
-        """Analyze one JS file — find routes, API endpoints, params, secrets"""
+    def _analyze_js(self, url, content):
         route_count = 0
         api_count = 0
 
-        # ══════════════════════════════════════════════════════════════
-        # 1. ROUTE + PARAM EXTRACTION (the key improvement)
-        # ══════════════════════════════════════════════════════════════
-
-        # ── Vue Router / Nuxt path definitions ──
-        # Match: path: "/detail/helpCenter", path: "/all", path: "/roulette"
-        for m in re.finditer(r'path\s*:\s*["\'](/[a-zA-Z0-9_/\-:.*?]*)["\']', content):
+        # ── 1. Vue Router path definitions ──
+        # ONLY accept path: "/lowercase/kebab-case" patterns
+        for m in re.finditer(r'path\s*:\s*["\'](/[a-z][a-zA-Z0-9_/\-:.*]*)["\']', content):
             route = m.group(1)
-            if len(route) < 2 or route.endswith(('.js', '.css', '.png', '.json')):
+            if not self._is_valid_route(route.split('?')[0]):
                 continue
+            resolved = re.sub(r':(\w+)', lambda x: self._guess_val(x.group(1)), route)
+            resolved = re.sub(r'/\(\.\*\)$', '', resolved)
+            resolved = re.sub(r'/\*$', '', resolved)
 
-            # Get wide context around this route to find associated params
-            ctx_start = max(0, m.start() - 2000)
-            ctx_end = min(len(content), m.end() + 2000)
+            self.valid_routes.add(resolved.split('?')[0])
+
+            # Find params in nearby context
+            ctx_start = max(0, m.start() - 1500)
+            ctx_end = min(len(content), m.end() + 1500)
             context = content[ctx_start:ctx_end]
+            params = self._extract_clean_params(context)
 
-            # Extract query params from context
-            params = self._extract_params_from_context(context)
-
-            # Resolve dynamic segments: /detail/:id → /detail/1
-            resolved = self._resolve_dynamic(route)
-
-            self.raw_routes.add(resolved)
             if params:
-                self.route_param_pairs.append({
-                    'route': resolved,
-                    'raw_route': route,
-                    'params': params,
-                    'method': 'GET',
-                    'source': url,
-                })
+                self.route_with_params.append({'route': resolved.split('?')[0], 'params': params})
             route_count += 1
 
-        # ── Nuxt route name → path conversion ──
-        # name: "detail-helpCenter", name: "all", name: "roulette"
-        for m in re.finditer(r'(?:name|component)\s*:\s*["\']([a-zA-Z][a-zA-Z0-9_\-]+)["\']', content):
-            name = m.group(1)
-            # Skip common non-route names
-            if name in ('default', 'index', 'error', 'layout', 'app', 'head', 'body',
-                        'script', 'style', 'template', 'slot', 'transition'):
+        # ── 2. Explicit URL strings with query params ──
+        # "/all?type=IsNew&page=1" — these are gold, take them directly
+        for m in re.finditer(r'["\'`](/[a-z][a-zA-Z0-9_/\-]*\?[a-zA-Z0-9_=&%\+\-\.]+)["\'`]', content):
+            full = m.group(1)
+            path = full.split('?')[0]
+            if not self._is_valid_route(path):
                 continue
-            # Convert name to path: "detail-helpCenter" → "/detail/helpCenter"
-            path = "/" + name.replace("---", "/").replace("--", "/").replace("-", "/")
-            # Also try keeping hyphens for some
-            path_hyphen = "/" + name
-
-            ctx_start = max(0, m.start() - 2000)
-            ctx_end = min(len(content), m.end() + 2000)
-            context = content[ctx_start:ctx_end]
-            params = self._extract_params_from_context(context)
-
-            self.raw_routes.add(path)
-            self.raw_routes.add(path_hyphen)
-            if params:
-                self.route_param_pairs.append({
-                    'route': path, 'params': params, 'method': 'GET', 'source': url,
-                })
-            route_count += 1
-
-        # ── Direct path strings with query params ──
-        # "/all?type=IsNew&page=1", "/roulette?page=1&name=f"
-        for m in re.finditer(r'["\'`](/[a-zA-Z][a-zA-Z0-9_/\-]*\?[a-zA-Z0-9_=&%\+\-\.]+)["\'`]', content):
-            full_path = m.group(1)
-            path_part = full_path.split('?')[0]
-            query_part = full_path.split('?')[1] if '?' in full_path else ''
 
             params = {}
-            for kv in query_part.split('&'):
+            query = full.split('?')[1] if '?' in full else ''
+            for kv in query.split('&'):
                 if '=' in kv:
                     k, v = kv.split('=', 1)
-                    params[k] = v
+                    if self._is_valid_param(k):
+                        params[k] = v if v else self._guess_val(k)
 
-            self.raw_routes.add(path_part)
+            self.valid_routes.add(path)
             if params:
-                self.route_param_pairs.append({
-                    'route': path_part, 'params': params, 'method': 'GET', 'source': url,
-                })
+                self.route_with_params.append({'route': path, 'params': params})
             route_count += 1
 
-        # ── All /path strings that look like routes ──
-        for m in re.finditer(r'["\'](/[a-z][a-zA-Z0-9]*(?:/[a-zA-Z0-9_\-]*)*)["\']', content):
+        # ── 3. Simple path strings (lowercase only) ──
+        for m in re.finditer(r'["\'](/[a-z][a-z0-9]*(?:/[a-zA-Z0-9_\-]*)*)["\']', content):
             path = m.group(1)
-            if any(path.endswith(ext) for ext in ('.js', '.css', '.png', '.json', '.svg', '.ico', '.map')):
-                continue
-            if any(seg in path for seg in ('node_modules', '__', 'assets/', 'static/', '_nuxt')):
-                continue
-            if len(path) > 1 and len(path) < 80:
-                self.raw_routes.add(path)
+            if self._is_valid_route(path) and len(path) > 1 and len(path) < 60:
+                self.valid_routes.add(path)
                 route_count += 1
 
-        # ══════════════════════════════════════════════════════════════
-        # 2. API ENDPOINTS
-        # ══════════════════════════════════════════════════════════════
-
-        api_patterns = [
+        # ── 4. API endpoints ──
+        api_pats = [
             (r'["\'`](/api/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]', None),
             (r'\.post\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'POST'),
             (r'\.get\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'GET'),
             (r'\.put\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'PUT'),
             (r'\.delete\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'DELETE'),
             (r'\.patch\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'PATCH'),
-            (r'(?:fetch|axios|request|\$http)\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', None),
-            (r'(?:url|endpoint|baseURL|apiUrl)\s*[:=]\s*["\'`](/api[a-zA-Z0-9_/\-{}:?=&]*)["\']', None),
-            (r'\+\s*["\'](/api/[a-zA-Z0-9_/\-]+)["\']', None),
         ]
 
-        for pat, forced_method in api_patterns:
+        for pat, forced_method in api_pats:
             for m in re.finditer(pat, content):
-                endpoint = m.group(1)
-                endpoint = re.sub(r'\$\{[^}]+\}', '1', endpoint)
+                ep = m.group(1)
+                ep = re.sub(r'\$\{[^}]+\}', '1', ep)
+                if any(ep.endswith(ext) for ext in ('.js', '.css', '.png')): continue
 
-                if any(endpoint.endswith(ext) for ext in ('.js', '.css', '.png')):
-                    continue
-
-                ctx_start = max(0, m.start() - 1000)
-                ctx_end = min(len(content), m.end() + 1000)
+                ctx_start = max(0, m.start() - 800)
+                ctx_end = min(len(content), m.end() + 800)
                 context = content[ctx_start:ctx_end]
 
-                method = forced_method or self._detect_method(endpoint, context)
-                params = self._extract_params_from_context(context)
+                method = forced_method or self._detect_method(ep, context)
                 body_params = self._extract_body_params(context) if method in ('POST', 'PUT', 'PATCH') else []
+                clean_params = self._extract_clean_params(context)
 
-                self.raw_api_endpoints.add(endpoint)
-                self.route_param_pairs.append({
-                    'route': endpoint,
-                    'params': params,
-                    'body_params': body_params,
-                    'method': method,
-                    'source': url,
+                self.api_endpoints.append({
+                    'path': ep, 'method': method, 'params': clean_params,
+                    'body_params': body_params, 'source': url,
                 })
                 api_count += 1
 
-        # ══════════════════════════════════════════════════════════════
-        # 3. GLOBAL QUERY PARAM NAMES
-        # ══════════════════════════════════════════════════════════════
-
-        # query.page, params.type, route.query.id, etc.
-        for m in re.finditer(r'(?:query|params|searchParams)\s*[\.\[]\s*["\']?(\w+)', content):
-            name = m.group(1)
-            if name not in ('length', 'toString', 'constructor', 'prototype', 'value',
-                           'key', 'default', 'get', 'set', 'has', 'delete'):
-                self.query_param_names.add(name)
-
-        # ?param= patterns
-        for m in re.finditer(r'[?&]([a-zA-Z_]\w{0,20})=', content):
-            self.query_param_names.add(m.group(1))
-
-        # ══════════════════════════════════════════════════════════════
-        # 4. SECRETS
-        # ══════════════════════════════════════════════════════════════
+        # ── 5. Secrets ──
         for sec_type, patterns in self.secret_patterns.items():
             for pat in patterns:
                 for m in re.finditer(pat, content, re.I):
                     val = m.group(1) if m.groups() else m.group(0)
                     if val and len(val) >= 8:
-                        skip = ('placeholder', 'example', 'test', 'xxx', 'null', 'undefined', 'localhost')
+                        skip = ('placeholder', 'example', 'test', 'xxx', 'null', 'undefined')
                         if not any(s in val.lower() for s in skip):
                             cs = max(0, m.start() - 60)
                             ce = min(len(content), m.end() + 60)
@@ -737,183 +716,116 @@ class EndpointHunter:
 
         return route_count, api_count
 
-    def _extract_params_from_context(self, context):
-        """Extract query parameter names+sample values from surrounding JS context"""
+    def _extract_clean_params(self, context):
+        """Extract ONLY real URL query params, not library config"""
         params = {}
 
-        # Direct query strings: ?type=IsNew&page=1
-        for m in re.finditer(r'[?&]([a-zA-Z_]\w{0,20})=([a-zA-Z0-9_\-\.%+]*)', context):
+        # From ?key=value patterns
+        for m in re.finditer(r'[?&]([a-zA-Z_]\w{2,20})=([a-zA-Z0-9_\-\.%+]*)', context):
             k, v = m.group(1), m.group(2)
-            if k not in params:
-                params[k] = v if v else self._guess_param_value(k)
+            if self._is_valid_param(k) and k not in params:
+                params[k] = v if v else self._guess_val(k)
 
-        # Object properties used as query: { type: "IsNew", page: 1 }
-        # params: { type: xxx, page: xxx }
-        for m in re.finditer(r'(?:query|params|searchParams)\s*[:=]?\s*\{([^}]{1,800})\}', context):
-            obj = m.group(1)
-            for km in re.finditer(r'([a-zA-Z_]\w{0,20})\s*:', obj):
-                k = km.group(1)
-                if k not in ('type', 'default', 'required', 'validator') or k == 'type':
-                    # Try to find the value
-                    val_match = re.search(rf'{re.escape(k)}\s*:\s*["\'`]?([a-zA-Z0-9_\-\.]+)', obj)
-                    val = val_match.group(1) if val_match else self._guess_param_value(k)
-                    if k not in params:
-                        params[k] = val
-
-        # route.query.xxx patterns
-        for m in re.finditer(r'(?:route|router|query|params)\s*\.\s*(?:query\s*\.\s*)?([a-zA-Z_]\w{0,20})', context):
+        # From query/params/searchParams objects (ONLY these specific contexts)
+        for m in re.finditer(r'(?:route\.query|searchParams|useRoute\(\)\.query|\$route\.query)\s*\.?\s*(?:\[["\'`])?(\w{2,20})', context):
             k = m.group(1)
-            if k not in ('push', 'replace', 'go', 'back', 'forward', 'resolve',
-                        'value', 'path', 'name', 'hash', 'matched', 'fullPath',
-                        'params', 'query', 'meta', 'redirectedFrom'):
-                if k not in params:
-                    params[k] = self._guess_param_value(k)
+            if self._is_valid_param(k) and k not in params:
+                params[k] = self._guess_val(k)
 
-        # Also record globally
-        self.query_param_names.update(params.keys())
+        # From URLSearchParams usage
+        for m in re.finditer(r'(?:URLSearchParams|searchParams).*?(?:get|set|append|has)\s*\(\s*["\'`](\w{2,20})["\'`]', context):
+            k = m.group(1)
+            if self._is_valid_param(k) and k not in params:
+                params[k] = self._guess_val(k)
 
         return params
 
     def _extract_body_params(self, context):
-        """Extract POST body parameter names"""
         params = []
-        for pat in [r'(?:data|body|payload)\s*[:=]\s*\{([^}]{1,800})\}',
-                    r'JSON\.stringify\s*\(\s*\{([^}]{1,800})\}']:
+        for pat in [r'(?:data|body|payload)\s*[:=]\s*\{([^}]{1,500})\}',
+                    r'JSON\.stringify\s*\(\s*\{([^}]{1,500})\}']:
             for m in re.findall(pat, context, re.I):
-                for km in re.finditer(r'([a-zA-Z_]\w{0,20})\s*:', m):
-                    params.append(km.group(1))
+                for km in re.finditer(r'([a-zA-Z_]\w{1,20})\s*:', m):
+                    p = km.group(1)
+                    if self._is_valid_param(p):
+                        params.append(p)
         return list(set(params))
-
-    def _resolve_dynamic(self, route):
-        """Resolve dynamic route segments: /detail/:id → /detail/1"""
-        route = re.sub(r':([a-zA-Z_]\w*)', lambda m: str(self._guess_param_value(m.group(1))), route)
-        route = re.sub(r'\{([a-zA-Z_]\w*)\}', lambda m: str(self._guess_param_value(m.group(1))), route)
-        # Remove Nuxt catch-all: /path/(.*) or /path/*
-        route = re.sub(r'/\(\.\*\)$', '', route)
-        route = re.sub(r'/\*$', '', route)
-        return route
 
     def _detect_method(self, endpoint, context):
         ctx = context.lower()
         for pat, meth in [
-            (r'\.post\s*\(', 'POST'), (r'\.put\s*\(', 'PUT'), (r'\.delete\s*\(', 'DELETE'),
-            (r'\.patch\s*\(', 'PATCH'), (r'method\s*[:=]\s*["\']post', 'POST'),
-            (r'method\s*[:=]\s*["\']put', 'PUT'), (r'method\s*[:=]\s*["\']delete', 'DELETE'),
+            (r'\.post\s*\(', 'POST'), (r'\.put\s*\(', 'PUT'),
+            (r'\.delete\s*\(', 'DELETE'), (r'\.patch\s*\(', 'PATCH'),
+            (r'method\s*[:=]\s*["\']post', 'POST'), (r'method\s*[:=]\s*["\']put', 'PUT'),
+            (r'method\s*[:=]\s*["\']delete', 'DELETE'),
         ]:
-            if re.search(pat, ctx):
-                return meth
+            if re.search(pat, ctx): return meth
         ep = endpoint.lower()
-        if any(w in ep for w in ('create', 'add', 'register', 'login', 'signup', 'upload', 'submit', 'save')):
-            return 'POST'
-        if any(w in ep for w in ('update', 'edit', 'modify')):
-            return 'PUT'
-        if any(w in ep for w in ('delete', 'remove')):
-            return 'DELETE'
+        if any(w in ep for w in ('create', 'add', 'register', 'login', 'signup', 'upload', 'submit', 'save')): return 'POST'
+        if any(w in ep for w in ('update', 'edit', 'modify')): return 'PUT'
+        if any(w in ep for w in ('delete', 'remove')): return 'DELETE'
         return 'GET'
 
-    def _guess_param_value(self, name):
-        """Generate ONE sample value for a parameter"""
-        n = name.lower()
-        if n in ('id', 'uid', 'gid', 'pid'): return 1
-        if n == 'page': return 1
-        if n == 'type': return 'IsNew'
-        if n == 'name': return 'test'
-        if n in ('limit', 'size', 'pageSize', 'per_page'): return 20
-        if n == 'sort': return 'new'
-        if n in ('status', 'state'): return 'active'
-        if n in ('lang', 'language', 'locale'): return 'en'
-        if n in ('category', 'cat'): return 'all'
-        if n == 'tab': return 1
-        if n in ('keyword', 'search', 'q'): return 'test'
-        if n == 'email': return 'test@test.com'
-        if n in ('token', 'access_token'): return 'TOKEN'
-        if n == 'origin': return 'web'
-        if n == 'platform': return 'pc'
-        if 'date' in n: return '2024-01-01'
-        if 'time' in n: return '1704067200'
-        if 'url' in n: return 'https://example.com'
-        if 'num' in n or 'count' in n: return 10
-        return 'test'
+    # ── Phase 4: Visit SPA routes ────────────────────────────────────────────
 
-    # ── Phase 4: Visit SPA routes to trigger more API calls ──────────────────
+    async def _phase4(self, page):
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 4: Visit SPA Routes ═══{C.END}\n")
 
-    async def _phase4_visit_routes(self, page):
-        """Visit discovered SPA routes to trigger their API calls"""
-        print(f"\n  {C.BOLD}{C.Y}═══ Phase 4: Visit SPA Routes (trigger APIs) ═══{C.END}\n")
-
-        # Navigate back to target first
         try:
             await page.goto(self.target_url, wait_until='domcontentloaded', timeout=15000)
             await page.wait_for_timeout(2000)
-        except:
-            pass
+        except: pass
 
-        # Prioritize interesting routes
         priority = ['all', 'game', 'slot', 'live', 'sport', 'vip', 'promotion', 'help',
                     'detail', 'user', 'account', 'wallet', 'deposit', 'withdraw',
-                    'history', 'record', 'rank', 'agent', 'referral', 'roulette',
-                    'lottery', 'wheel', 'bonus', 'rebate', 'invite', 'message']
+                    'history', 'record', 'rank', 'agent', 'roulette', 'lottery',
+                    'wheel', 'bonus', 'rebate', 'invite', 'message', 'about']
 
-        routes = sorted(self.raw_routes)
-        pri_routes = [r for r in routes if any(kw in r.lower() for kw in priority)]
-        other_routes = [r for r in routes if r not in pri_routes]
-        ordered = pri_routes + other_routes
+        routes = sorted(self.valid_routes)
+        pri = [r for r in routes if any(kw in r.lower() for kw in priority)]
+        other = [r for r in routes if r not in pri]
+        ordered = pri + other
 
-        visited = set()
+        visited_paths = set()
         count = 0
         for route in ordered:
-            if count >= self.max_pages:
-                break
-            # Clean route
-            if route.startswith('http'):
-                if not self._is_target_scope(route):
-                    continue
-                path = urlparse(route).path
-            else:
-                path = route.split('?')[0]
+            if count >= self.max_pages: break
+            path = route.split('?')[0]
+            if path in visited_paths or path == '/': continue
+            visited_paths.add(path)
 
-            if path in visited or path == '/':
-                continue
-            visited.add(path)
-
-            full_url = self.origin + route if route.startswith('/') else route
+            full_url = self.origin + route
             self._log(f"[{count+1:03d}] {route[:80]}", "dim")
 
             try:
                 await page.goto(full_url, wait_until='domcontentloaded', timeout=12000)
-                try:
-                    await page.wait_for_load_state('networkidle', timeout=6000)
-                except:
-                    pass
+                try: await page.wait_for_load_state('networkidle', timeout=6000)
+                except: pass
                 await page.wait_for_timeout(1200)
 
-                # Light interaction on each page
+                # Light scroll
                 await page.evaluate('''async () => {
                     for (let i = 0; i < 5; i++) { window.scrollBy(0, 400); await new Promise(r => setTimeout(r, 200)); }
                 }''')
                 await page.wait_for_timeout(500)
-
                 count += 1
-            except:
-                pass
+            except: pass
 
-        self._log(f"Visited {count} routes, total intercepted: {len(self.intercepted)}", "ok")
+        self._log(f"Visited {count} routes", "ok")
 
-    # ── Phase 5: Build final URL list ────────────────────────────────────────
+    # ── Phase 5: Build final URLs ────────────────────────────────────────────
 
-    def _phase5_build_urls(self):
-        """Build final deduped URL list — ONE url per route+param structure"""
-        print(f"\n  {C.BOLD}{C.Y}═══ Phase 5: Build Complete URLs (dedup) ═══{C.END}\n")
+    def _phase5(self):
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 5: Build Final URLs (strict dedup) ═══{C.END}\n")
 
-        seen_sigs = set()
+        seen = set()
 
         def _add(method, url, extra=None):
             parsed = urlparse(url)
             pkeys = sorted(parse_qs(parsed.query, keep_blank_values=True).keys())
             sig = self._sig(method, parsed.path, pkeys)
-            if sig in seen_sigs:
-                return
-            seen_sigs.add(sig)
+            if sig in seen: return
+            seen.add(sig)
 
             entry = {
                 'url': url, 'method': method, 'path': parsed.path,
@@ -921,62 +833,63 @@ class EndpointHunter:
                                 for k, v in parse_qs(parsed.query, keep_blank_values=True).items()},
                 **(extra or {}),
             }
-            if method == 'GET':
-                self.get_endpoints[url] = entry
-            elif method == 'POST':
-                self.post_endpoints[url] = entry
-            else:
-                self.other_endpoints[url] = entry
+            if method == 'GET': self.get_endpoints[url] = entry
+            elif method == 'POST': self.post_endpoints[url] = entry
+            else: self.other_endpoints[url] = entry
 
-        # 1. Network intercepted requests
+        # 1. Network intercepted (highest confidence)
         for req in self.intercepted:
-            url = req['url']
-            method = req['method']
             extra = {}
-            if req.get('post_data') and not str(req.get('post_data','')).startswith('<binary'):
+            if req.get('post_data') and not str(req.get('post_data', '')).startswith('<binary'):
                 extra['post_data'] = req['post_data']
-            _add(method, url, extra)
+            _add(req['method'], req['url'], extra)
 
-        # 2. Route + param pairs from JS analysis
-        for pair in self.route_param_pairs:
-            route = pair['route']
-            params = pair.get('params', {})
-            method = pair['method']
-            body_params = pair.get('body_params', [])
-
-            if route.startswith('http'):
-                base = route.split('?')[0]
+        # 2. API endpoints from JS
+        for ep in self.api_endpoints:
+            path = ep['path']
+            if path.startswith('http'):
+                base = path.split('?')[0]
             else:
-                base = self.origin + route.split('?')[0]
+                base = self.origin + path.split('?')[0]
 
+            params = ep.get('params', {})
             if params:
-                qs = urlencode(params)
-                url = f"{base}?{qs}"
+                url = f"{base}?{urlencode(params)}"
             else:
                 url = base
 
             extra = {}
-            if body_params:
-                extra['body_params'] = body_params
+            if ep.get('body_params'):
+                extra['body_params'] = ep['body_params']
                 extra['content_type'] = 'application/json'
+            _add(ep['method'], url, extra)
 
-            _add(method, url, extra)
+        # 3. Routes with params
+        for pair in self.route_with_params:
+            route = pair['route']
+            params = pair.get('params', {})
+            base = self.origin + route
 
-        # 3. Raw routes without params (just the path)
-        for route in self.raw_routes:
-            if route.startswith('http'):
-                url = route
+            # Flatten parse_qs style params
+            clean_params = {}
+            for k, v in params.items():
+                if isinstance(v, list):
+                    clean_params[k] = v[0]
+                else:
+                    clean_params[k] = v
+
+            if clean_params:
+                url = f"{base}?{urlencode(clean_params)}"
             else:
-                url = self.origin + route
+                url = base
             _add('GET', url)
 
-        # 4. Raw API endpoints
-        for ep in self.raw_api_endpoints:
-            url = self.origin + ep if not ep.startswith('http') else ep
-            _add('GET', url)  # These often get reclassified from intercepted data
+        # 4. Bare routes (no params)
+        for route in self.valid_routes:
+            url = self.origin + route
+            _add('GET', url)
 
-        self._log(f"GET: {len(self.get_endpoints)}, POST: {len(self.post_endpoints)}, "
-                  f"OTHER: {len(self.other_endpoints)}", "ok")
+        self._log(f"Final: GET={len(self.get_endpoints)} POST={len(self.post_endpoints)} OTHER={len(self.other_endpoints)}", "ok")
 
     # ── cURL + Save ──────────────────────────────────────────────────────────
 
@@ -985,17 +898,15 @@ class EndpointHunter:
         method = entry['method']
         v = '-v' if verbose else '-s -o /dev/null -w "%{http_code}"'
         cmd = f'curl {v} -X {method} "{url}"'
-
         if method in ('POST', 'PUT', 'PATCH'):
             ct = entry.get('content_type', 'application/json')
             cmd += f' \\\n  -H "Content-Type: {ct}"'
             pd = entry.get('post_data')
             bp = entry.get('body_params', [])
             if pd:
-                safe = pd.replace("'", "'\\''")
-                cmd += f" \\\n  -d '{safe}'"
+                cmd += f" \\\n  -d '{pd.replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'"
             elif bp:
-                body = {p: self._guess_param_value(p) for p in bp}
+                body = {p: self._guess_val(p) for p in bp}
                 cmd += f" \\\n  -d '{json.dumps(body)}'"
             else:
                 cmd += " \\\n  -d '{}'"
@@ -1006,20 +917,16 @@ class EndpointHunter:
 
         # GET
         with open(os.path.join(od, "GET_endpoints.txt"), 'w') as f:
-            f.write(f"# GET Endpoints — {len(self.get_endpoints)}\n")
-            f.write(f"# Target: {self.target_url}\n")
-            f.write(f"# {datetime.now().isoformat()}\n#\n\n")
+            f.write(f"# GET Endpoints — {len(self.get_endpoints)}\n# Target: {self.target_url}\n# {datetime.now().isoformat()}\n\n")
             for url in sorted(self.get_endpoints.keys()):
                 f.write(f"{url}\n")
 
         # POST
         with open(os.path.join(od, "POST_endpoints.txt"), 'w') as f:
-            f.write(f"# POST Endpoints — {len(self.post_endpoints)}\n")
-            f.write(f"# Target: {self.target_url}\n#\n\n")
+            f.write(f"# POST Endpoints — {len(self.post_endpoints)}\n# Target: {self.target_url}\n\n")
             for url, e in sorted(self.post_endpoints.items()):
                 f.write(f"{url}\n")
-                if e.get('body_params'):
-                    f.write(f"  Body: {', '.join(e['body_params'])}\n")
+                if e.get('body_params'): f.write(f"  Body: {', '.join(e['body_params'])}\n")
                 if e.get('post_data') and not str(e.get('post_data','')).startswith('<binary'):
                     f.write(f"  Data: {str(e['post_data'])[:300]}\n")
                 f.write("\n")
@@ -1027,60 +934,44 @@ class EndpointHunter:
         # OTHER
         if self.other_endpoints:
             with open(os.path.join(od, "OTHER_endpoints.txt"), 'w') as f:
-                f.write(f"# PUT/DELETE/PATCH — {len(self.other_endpoints)}\n\n")
                 for url, e in sorted(self.other_endpoints.items()):
                     f.write(f"[{e['method']}] {url}\n")
 
         # ALL
         with open(os.path.join(od, "ALL_endpoints.txt"), 'w') as f:
-            f.write(f"# All Endpoints | GET: {len(self.get_endpoints)} POST: {len(self.post_endpoints)} OTHER: {len(self.other_endpoints)}\n\n")
+            f.write(f"# GET: {len(self.get_endpoints)} | POST: {len(self.post_endpoints)} | OTHER: {len(self.other_endpoints)}\n\n")
             for label, eps in [("GET", self.get_endpoints), ("POST", self.post_endpoints), ("OTHER", self.other_endpoints)]:
                 if eps:
                     f.write(f"# ── {label} ({len(eps)}) ──\n")
-                    for url, e in sorted(eps.items()):
-                        prefix = f"[{e['method']}] " if label == "OTHER" else ""
-                        f.write(f"{prefix}{url}\n")
+                    for url in sorted(eps.keys()): f.write(f"{url}\n")
                     f.write("\n")
 
         # SPA routes
         with open(os.path.join(od, "SPA_routes.txt"), 'w') as f:
-            f.write(f"# SPA Routes — {len(self.raw_routes)}\n\n")
-            for r in sorted(self.raw_routes):
-                f.write(f"{self.origin}{r}\n")
+            f.write(f"# Valid SPA Routes — {len(self.valid_routes)}\n\n")
+            for r in sorted(self.valid_routes): f.write(f"{self.origin}{r}\n")
 
-        # curl GET
-        p = os.path.join(od, "curl_GET.sh")
-        with open(p, 'w') as f:
-            f.write("#!/bin/bash\n# GET verification\n\n")
-            for url, e in sorted(self.get_endpoints.items()):
-                f.write(f"echo \"[GET] {e.get('path', url[:80])}\"\n{self._make_curl(e)}\necho \"\"\n\n")
-        os.chmod(p, 0o755)
+        # cURL
+        for fname, eps in [("curl_GET.sh", self.get_endpoints), ("curl_POST.sh", self.post_endpoints)]:
+            p = os.path.join(od, fname)
+            with open(p, 'w') as f:
+                f.write(f"#!/bin/bash\n# {fname}\n\n")
+                for url, e in sorted(eps.items()):
+                    f.write(f"echo \"[{e['method']}] {e.get('path', url[:80])}\"\n{self._make_curl(e)}\necho \"\"\n\n")
+            os.chmod(p, 0o755)
 
-        # curl POST
-        p = os.path.join(od, "curl_POST.sh")
-        with open(p, 'w') as f:
-            f.write("#!/bin/bash\n# POST verification\n\n")
-            for url, e in sorted(self.post_endpoints.items()):
-                f.write(f"echo \"[POST] {e.get('path', url[:80])}\"\n{self._make_curl(e)}\necho \"\"\n\n")
-        os.chmod(p, 0o755)
-
-        # curl ALL verbose
         p = os.path.join(od, "curl_ALL_verbose.sh")
         with open(p, 'w') as f:
-            f.write("#!/bin/bash\n# All — verbose\n\n")
+            f.write("#!/bin/bash\n\n")
             all_e = list(self.get_endpoints.items()) + list(self.post_endpoints.items()) + list(self.other_endpoints.items())
             for url, e in sorted(all_e, key=lambda x: x[0]):
                 f.write(f"# [{e['method']}] {e.get('path','')}\n{self._make_curl(e, verbose=True)}\n\n")
         os.chmod(p, 0o755)
 
-        # API calls
+        # API calls log
         with open(os.path.join(od, "API_calls.txt"), 'w') as f:
-            seen = OrderedDict()
+            f.write(f"# API Calls — {len(self.api_log_seen)} unique\n\n")
             for key, count in self.api_log_seen.items():
-                if key not in seen:
-                    seen[key] = count
-            f.write(f"# API Calls (unique) — {len(seen)}\n\n")
-            for key, count in seen.items():
                 f.write(f"{key} (×{count})\n")
 
         # Secrets
@@ -1089,22 +980,17 @@ class EndpointHunter:
             seen_s = set()
             for s in self.secrets:
                 key = (s['type'], s['value'])
-                if key not in seen_s:
-                    seen_s.add(key)
-                    unique.append(s)
+                if key not in seen_s: seen_s.add(key); unique.append(s)
             with open(os.path.join(od, "SECRETS.txt"), 'w') as f:
-                f.write(f"# Secrets: {len(unique)}\n\n")
-                for s in unique:
-                    f.write(f"[{s['type']}] {s['value']}\n  {s['file']}\n  {s['context'][:200]}\n\n")
+                for s in unique: f.write(f"[{s['type']}] {s['value']}\n  {s['file']}\n\n")
             with open(os.path.join(od, "SECRETS.json"), 'w') as f:
                 json.dump(unique, f, indent=2)
 
         # JS files
         with open(os.path.join(od, "JS_files.txt"), 'w') as f:
-            f.write(f"# JS: {len(self.js_urls)} ({len(self.js_content)} downloaded)\n\n")
+            f.write(f"# JS: {len(self.js_content)}/{len(self.js_urls)}\n\n")
             for u in sorted(self.js_urls):
-                dl = "✓" if u in self.js_content else "✗"
-                f.write(f"[{dl}] {u}\n")
+                f.write(f"[{'✓' if u in self.js_content else '✗'}] {u}\n")
 
         # Postman
         postman = {
@@ -1116,13 +1002,13 @@ class EndpointHunter:
             for url, e in sorted(eps.items()):
                 item = {"name": e.get('path', url[:60]), "request": {"method": label, "url": url}}
                 if label == 'POST':
-                    item['request']['header'] = [{"key": "Content-Type", "value": e.get('content_type', 'application/json')}]
+                    item['request']['header'] = [{"key": "Content-Type", "value": "application/json"}]
                     bp = e.get('body_params', [])
                     pd = e.get('post_data')
                     if pd and not str(pd).startswith('<binary'):
                         item['request']['body'] = {"mode": "raw", "raw": pd}
                     elif bp:
-                        item['request']['body'] = {"mode": "raw", "raw": json.dumps({p: self._guess_param_value(p) for p in bp})}
+                        item['request']['body'] = {"mode": "raw", "raw": json.dumps({p: self._guess_val(p) for p in bp})}
                 folder['item'].append(item)
             postman['item'].append(folder)
         with open(os.path.join(od, "postman_collection.json"), 'w') as f:
@@ -1131,52 +1017,42 @@ class EndpointHunter:
         # Summary
         n_sec = len(set((s['type'], s['value']) for s in self.secrets))
         with open(os.path.join(od, "SUMMARY.txt"), 'w') as f:
-            f.write(f"{'='*60}\n EndpointHunter v4.0\n{'='*60}\n")
-            f.write(f" Target:     {self.target_url}\n")
-            f.write(f" Date:       {datetime.now().isoformat()}\n")
-            f.write(f" GET:        {len(self.get_endpoints)}\n")
-            f.write(f" POST:       {len(self.post_endpoints)}\n")
-            f.write(f" OTHER:      {len(self.other_endpoints)}\n")
-            f.write(f" SPA routes: {len(self.raw_routes)}\n")
-            f.write(f" JS files:   {len(self.js_urls)} ({len(self.js_content)} dl)\n")
-            f.write(f" Secrets:    {n_sec}\n")
-            f.write(f"{'='*60}\n")
+            f.write(f"{'='*60}\n EndpointHunter v5.0\n{'='*60}\n")
+            f.write(f" Target:     {self.target_url}\n GET:        {len(self.get_endpoints)}\n")
+            f.write(f" POST:       {len(self.post_endpoints)}\n OTHER:      {len(self.other_endpoints)}\n")
+            f.write(f" Routes:     {len(self.valid_routes)}\n JS:         {len(self.js_content)}/{len(self.js_urls)}\n")
+            f.write(f" Secrets:    {n_sec}\n{'='*60}\n")
 
     # ── Main ─────────────────────────────────────────────────────────────────
 
     async def run(self):
         start = datetime.now()
         banner()
-
-        print(f"  {C.BOLD}Target:{C.END}    {self.target_url}")
-        print(f"  {C.BOLD}Depth:{C.END}     {self.max_depth}")
-        print(f"  {C.BOLD}Output:{C.END}    {self.output_dir}/")
+        print(f"  {C.BOLD}Target:{C.END} {self.target_url}  |  {C.BOLD}Output:{C.END} {self.output_dir}/\n")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=self.headless,
-                args=['--no-sandbox', '--disable-setuid-sandbox',
-                      '--disable-blink-features=AutomationControlled']
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
             )
             context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                           '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 viewport={'width': 1920, 'height': 1080},
             )
             page = await context.new_page()
             page.on('request', self._on_request)
+            page.on('request', self._on_request_js)
             page.on('response', self._on_response)
 
-            await self._phase1_load_and_intercept(page)
-            await self._phase2_download_all_js(page)
-            self._phase3_analyze_js()
-            await self._phase4_visit_routes(page)
-            self._phase5_build_urls()
+            await self._phase1(page)
+            await self._phase2(page)
+            self._phase3()
+            await self._phase4(page)
+            self._phase5()
 
             await browser.close()
 
         self._save()
-
         elapsed = datetime.now() - start
         n_sec = len(set((s['type'], s['value']) for s in self.secrets))
 
@@ -1184,56 +1060,26 @@ class EndpointHunter:
   {C.BOLD}{C.G}{'═'*60}
   SCAN COMPLETE
   {'═'*60}{C.END}
-  {C.W}Output:       {C.CY}{self.output_dir}/{C.END}
-  {C.W}GET:          {C.G}{len(self.get_endpoints)}{C.END}
-  {C.W}POST:         {C.R}{len(self.post_endpoints)}{C.END}
-  {C.W}OTHER:        {C.Y}{len(self.other_endpoints)}{C.END}
-  {C.W}SPA Routes:   {C.G}{len(self.raw_routes)}{C.END}
-  {C.W}JS Files:     {C.G}{len(self.js_content)}/{len(self.js_urls)}{C.END}
-  {C.W}Secrets:      {C.R}{n_sec}{C.END}
-  {C.W}Time:         {C.CY}{elapsed}{C.END}
+  {C.W}Output:    {C.CY}{self.output_dir}/{C.END}
+  {C.W}GET:       {C.G}{len(self.get_endpoints)}{C.END}
+  {C.W}POST:      {C.R}{len(self.post_endpoints)}{C.END}
+  {C.W}OTHER:     {C.Y}{len(self.other_endpoints)}{C.END}
+  {C.W}Routes:    {C.G}{len(self.valid_routes)}{C.END}
+  {C.W}JS:        {C.G}{len(self.js_content)}/{len(self.js_urls)}{C.END}
+  {C.W}Secrets:   {C.R}{n_sec}{C.END}
+  {C.W}Time:      {C.CY}{elapsed}{C.END}
   {C.BOLD}{C.G}{'═'*60}{C.END}
-
-  {C.BOLD}Files:{C.END}
-  {C.DIM}├── GET_endpoints.txt       — One URL per line
-  ├── POST_endpoints.txt      — POST + body params
-  ├── ALL_endpoints.txt       — Combined
-  ├── SPA_routes.txt          — Client routes from JS
-  ├── API_calls.txt           — Observed API calls
-  ├── curl_GET.sh / curl_POST.sh / curl_ALL_verbose.sh
-  ├── postman_collection.json
-  ├── SECRETS.txt / .json
-  ├── JS_files.txt
-  └── js_files/               — Downloaded JS{C.END}
 """)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='EndpointHunter v4.0 — Chunk-First SPA Endpoint Discovery',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 endpoint_hunter_v4.py https://mgc88.cc/
-  python3 endpoint_hunter_v4.py https://target.com -d 15 -v
-  python3 endpoint_hunter_v4.py https://target.com --auth "token=abc"
-
-Key changes in v4:
-  ✓ Downloads ALL JS chunks (including from CDN domains like cdn360-pc-h5.w0zuv.live)
-  ✓ Pairs routes with their query params from JS context
-  ✓ Builds complete URLs: /all?type=IsNew&page=1, /detail/helpCenter?id=1
-  ✓ ONE URL per route+param structure (strict dedup)
-  ✓ Visits discovered SPA routes to trigger API calls
-  ✓ No duplicate log spam
-        """
-    )
-
+    parser = argparse.ArgumentParser(description='EndpointHunter v5.0 — Clean SPA Endpoint Discovery')
     parser.add_argument('url', help='Target URL')
-    parser.add_argument('-d', '--depth', type=int, default=10, help='Max depth (default: 10)')
-    parser.add_argument('--auth', help='Auth params (e.g., "uid=123&key=abc")')
+    parser.add_argument('-d', '--depth', type=int, default=10)
+    parser.add_argument('--auth', help='Auth params')
     parser.add_argument('-v', '--verbose', action='store_true')
-    parser.add_argument('--max-pages', type=int, default=300, help='Max SPA routes to visit (default: 300)')
-    parser.add_argument('--timeout', type=int, default=60, help='Timeout secs (default: 60)')
+    parser.add_argument('--max-pages', type=int, default=300)
+    parser.add_argument('--timeout', type=int, default=60)
     parser.add_argument('--show-browser', action='store_true')
 
     args = parser.parse_args()
