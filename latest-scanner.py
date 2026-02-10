@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-EndpointHunter v3.0 — SPA-Aware Burp-Style Endpoint Discovery
-Handles Nuxt/Vue/React SPAs, intercepts all traffic, extracts client-side routes
+EndpointHunter v4.0 — SPA Chunk-First Endpoint Discovery
+Strategy: Download ALL JS chunks → extract routes+params together → build complete URLs
+One unique URL per route+param structure (no duplicates)
 """
 
 import asyncio
@@ -10,11 +11,10 @@ import json
 import argparse
 import os
 import sys
-import traceback
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
 from datetime import datetime
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 
 try:
     from playwright.async_api import async_playwright
@@ -38,8 +38,8 @@ class C:
 def banner():
     print(f"""{C.CY}
  ╔═══════════════════════════════════════════════════════════════════╗
- ║  {C.BOLD}EndpointHunter v3.0{C.END}{C.CY} — SPA-Aware Endpoint Discovery          ║
- ║  Network Intercept · JS Route Extraction · Deep Interaction      ║
+ ║  {C.BOLD}EndpointHunter v4.0{C.END}{C.CY} — Chunk-First SPA Endpoint Discovery    ║
+ ║  ALL JS Chunks · Route+Param Pairing · Complete URL Builder      ║
  ╚═══════════════════════════════════════════════════════════════════╝{C.END}
 """)
 
@@ -47,7 +47,7 @@ def banner():
 class EndpointHunter:
 
     def __init__(self, target_url, max_depth=10, auth_params=None, verbose=False,
-                 headless=True, timeout=60, max_pages=500):
+                 headless=True, timeout=60, max_pages=300):
         self.target_url = target_url.rstrip("/")
         self.max_depth = max_depth
         self.auth_params = auth_params or ""
@@ -62,54 +62,61 @@ class EndpointHunter:
         self.netloc = parsed.netloc
         self.base_domain = self._get_base_domain(parsed.netloc)
 
-        # Data stores
-        self.visited_pages = set()
-        self.js_files = set()
-        self.js_content_cache = {}
+        # Track ALL domains the site uses (CDN, API, etc.)
+        self.asset_domains = set()  # CDN domains serving JS chunks
+        self.asset_domains.add(self.netloc)
+
+        # JS
+        self.js_urls = set()
+        self.js_content = {}       # url -> content
         self.analyzed_js = set()
 
-        # Network intercept (Burp-style HTTP history)
-        self.intercepted_requests = []
-        self.intercepted_urls = set()
-        self.api_calls = []  # JSON API calls specifically
+        # Network intercept
+        self.intercepted = []
+        self.api_log_seen = {}
 
-        # SPA routes discovered from JS
-        self.spa_routes = set()
+        # Discovered data
+        self.raw_routes = set()           # /path only
+        self.raw_api_endpoints = set()    # /api/... paths
+        self.route_param_pairs = []       # [{route, params, method, context}]
+        self.query_param_names = set()    # all param names found globally
 
-        # Final results
+        # Final output — ONE url per structural signature
         self.get_endpoints = OrderedDict()
         self.post_endpoints = OrderedDict()
         self.other_endpoints = OrderedDict()
 
-        # JS analysis
-        self.js_extracted_endpoints = []
-        self.js_extracted_secrets = []
-
-        # URL patterns seen (for dedup)
-        self.seen_signatures = set()
-
+        self.secrets = []
         self.output_dir = self._create_output_dir()
 
         self.secret_patterns = {
             'API Key': [r'(?i)(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([a-zA-Z0-9_\-]{16,})["\']'],
             'Secret/Token': [r'(?i)(?:secret|token|auth)[_-]?(?:key)?["\']?\s*[:=]\s*["\']([a-zA-Z0-9_\-\.]{20,})["\']'],
-            'Bearer Token': [r'(?i)bearer\s+([a-zA-Z0-9_\-\.]{30,})'],
+            'Bearer': [r'(?i)bearer\s+([a-zA-Z0-9_\-\.]{30,})'],
             'JWT': [r'eyJ[a-zA-Z0-9_\-]{10,}\.eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}'],
             'AWS Key': [r'AKIA[0-9A-Z]{16}'],
-            'Google API Key': [r'AIza[0-9A-Za-z_\-]{35}'],
-            'Private Key': [r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'],
-            'Database URL': [r'(?:mongodb(?:\+srv)?|mysql|postgres(?:ql)?|redis)://[^\s"\'<>]+'],
+            'Private Key': [r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----'],
+            'DB URL': [r'(?:mongodb(?:\+srv)?|mysql|postgres(?:ql)?|redis)://[^\s"\'<>]+'],
         }
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _get_base_domain(self, netloc):
         parts = netloc.split(".")
         return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
 
-    def _is_same_scope(self, url):
+    def _is_target_scope(self, url):
+        """Is this URL on the target domain (for endpoints)?"""
         try:
-            parsed = urlparse(url)
-            return parsed.netloc == self.netloc or \
-                   parsed.netloc.endswith("." + self.base_domain)
+            return urlparse(url).netloc == self.netloc
+        except:
+            return False
+
+    def _is_asset_scope(self, url):
+        """Is this URL on a known asset/CDN domain (for JS files)?"""
+        try:
+            netloc = urlparse(url).netloc
+            return netloc in self.asset_domains or netloc == self.netloc
         except:
             return False
 
@@ -122,21 +129,21 @@ class EndpointHunter:
         Path(os.path.join(d, "js_files")).mkdir(exist_ok=True)
         return d
 
-    def _url_signature(self, method, url):
-        """Structural signature for dedup — replaces IDs with placeholders"""
-        parsed = urlparse(url)
-        parts = parsed.path.split("/")
-        sig = []
+    def _sig(self, method, path, param_keys):
+        """Structural signature for dedup: method + path_template + sorted_param_keys"""
+        # Normalize path: replace numeric segments with {N}
+        parts = path.split("/")
+        norm = []
         for p in parts:
             if re.match(r'^\d+$', p):
-                sig.append("{N}")
+                norm.append("{N}")
             elif re.match(r'^[a-f0-9]{8,}$', p, re.I):
-                sig.append("{HASH}")
+                norm.append("{H}")
             else:
-                sig.append(p)
-        sig_path = "/".join(sig)
-        param_keys = "&".join(sorted(parse_qs(parsed.query, keep_blank_values=True).keys()))
-        return f"{method}:{parsed.netloc}{sig_path}?{param_keys}"
+                norm.append(p)
+        norm_path = "/".join(norm)
+        keys = ",".join(sorted(param_keys)) if param_keys else ""
+        return f"{method}|{norm_path}|{keys}"
 
     def _log(self, msg, level="info"):
         colors = {"info": C.CY, "ok": C.G, "warn": C.Y, "err": C.R, "dim": C.DIM}
@@ -144,773 +151,834 @@ class EndpointHunter:
 
     def _vlog(self, msg):
         if self.verbose:
-            print(f"  {C.DIM}{msg}{C.END}")
+            print(f"    {C.DIM}{msg}{C.END}")
 
-    # ─── Network Interception ────────────────────────────────────────────────
+    # ── Network Interception ─────────────────────────────────────────────────
 
     def _on_request(self, request):
-        """Intercept every network request — handles binary post_data safely"""
         url = request.url
-        method = request.method
-
         if not url.startswith("http"):
             return
 
-        # ── Skip out-of-scope domains (CDN, analytics, third-party) ──
-        if not self._is_same_scope(url):
+        parsed = urlparse(url)
+
+        # Detect CDN domains serving JS/assets for this site
+        if parsed.path.endswith('.js') and ('_nuxt' in url or 'chunk' in url or 'assets' in url):
+            self.asset_domains.add(parsed.netloc)
+            clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+            self.js_urls.add(clean)
             return
 
-        # Skip static assets
-        parsed = urlparse(url)
+        # Only record endpoints on the TARGET domain
+        if not self._is_target_scope(url):
+            return
+
+        # Skip static
         skip_ext = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff',
-                    '.woff2', '.ttf', '.eot', '.mp4', '.mp3', '.webp', '.avif',
-                    '.css', '.map')
+                    '.woff2', '.ttf', '.eot', '.mp4', '.mp3', '.webp', '.css', '.map')
         if any(parsed.path.lower().endswith(ext) for ext in skip_ext):
             return
 
-        # ── SAFE post_data extraction (fixes the UnicodeDecodeError) ──
+        # Also record JS on target domain
+        if parsed.path.endswith('.js'):
+            self.js_urls.add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')))
+            return
+
+        # Safe post_data
         post_data = None
         try:
             post_data = request.post_data
         except Exception:
-            # Binary body (gzip, protobuf, etc.) — try raw bytes
             try:
                 raw = request.post_data_buffer
-                if raw:
-                    post_data = f"<binary:{len(raw)}bytes>"
-            except Exception:
-                post_data = None
+                post_data = f"<binary:{len(raw)}b>" if raw else None
+            except:
+                pass
 
-        # Record JS files separately
-        if parsed.path.endswith('.js'):
-            if self._is_same_scope(url):
-                clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
-                self.js_files.add(clean)
-            return
-
-        req_data = {
-            'url': url,
-            'method': method.upper(),
-            'post_data': post_data,
-            'path': parsed.path,
-            'query': parsed.query,
-        }
-        self.intercepted_requests.append(req_data)
-        self.intercepted_urls.add(url)
+        method = request.method.upper()
+        self.intercepted.append({
+            'url': url, 'method': method, 'post_data': post_data,
+            'path': parsed.path, 'query': parsed.query,
+        })
 
     def _on_response(self, response):
-        """Track API (JSON) responses — deduped, in-scope only"""
         try:
             url = response.url
-            method = response.request.method.upper()
-
-            # Skip out-of-scope domains
-            if not self._is_same_scope(url):
+            if not self._is_target_scope(url):
+                return
+            ct = response.headers.get('content-type', '')
+            if 'application/json' not in ct:
                 return
 
-            content_type = response.headers.get('content-type', '')
-            if 'application/json' in content_type:
-                # Dedup key: method + URL (ignore query param values, keep keys)
-                parsed = urlparse(url)
-                param_keys = "&".join(sorted(parse_qs(parsed.query).keys()))
-                dedup_key = f"{method}:{parsed.netloc}{parsed.path}?{param_keys}"
+            method = response.request.method.upper()
+            parsed = urlparse(url)
+            pkeys = ",".join(sorted(parse_qs(parsed.query).keys()))
+            dedup = f"{method}:{parsed.path}:{pkeys}"
 
-                if not hasattr(self, '_api_log_seen'):
-                    self._api_log_seen = {}
-
-                count = self._api_log_seen.get(dedup_key, 0)
-                self._api_log_seen[dedup_key] = count + 1
-
-                self.api_calls.append({
-                    'url': url,
-                    'method': method,
-                    'status': response.status,
-                })
-
-                # Only print first 2 occurrences, then suppress
-                if count < 2:
-                    self._vlog(f"[API] {method} {url}")
-                elif count == 2:
-                    self._vlog(f"[API] {method} {url} (suppressing further duplicates)")
-        except Exception:
+            count = self.api_log_seen.get(dedup, 0)
+            self.api_log_seen[dedup] = count + 1
+            if count < 2:
+                self._vlog(f"[API] {method} {url[:120]}")
+            elif count == 2:
+                self._vlog(f"[API] {method} {parsed.path} (suppressing dupes)")
+        except:
             pass
 
-    # ─── SPA Route Extraction from JS Bundles ────────────────────────────────
+    # ── Phase 1: Load page, intercept traffic, discover CDN domain ───────────
 
-    def _extract_spa_routes(self, content, source_url=""):
-        """Extract Vue/Nuxt/React router routes from JS content"""
-        routes = set()
+    async def _phase1_load_and_intercept(self, page):
+        """Load the target, interact heavily, capture all network + discover CDN"""
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 1: Load Target + Intercept Traffic ═══{C.END}\n")
 
-        # ── Nuxt 3 / Vue Router route definitions ──
-        # path: "/all", path: "/detail/helpCenter"
-        for m in re.finditer(r'path\s*:\s*["\'](/[a-zA-Z0-9_/\-:?{}]*)["\']', content):
-            route = m.group(1)
-            if len(route) > 1 and not route.endswith('.js'):
-                routes.add(route)
-
-        # ── Nuxt 3 payload/manifest route entries ──
-        # "all", "detail-helpCenter", "auth", etc. in route arrays
-        for m in re.finditer(r'(?:name|route)\s*:\s*["\']([a-zA-Z][a-zA-Z0-9_\-]*)["\']', content):
-            name = m.group(1)
-            # Convert Nuxt route names to paths: "detail-helpCenter" → "/detail/helpCenter"
-            path = "/" + name.replace("-", "/").replace("_", "/")
-            if len(path) > 1:
-                routes.add(path)
-
-        # ── Direct path strings that look like routes ──
-        # "/all", "/detail/helpCenter", "/promotion", "/vip"
-        for m in re.finditer(r'["\'](/[a-z][a-zA-Z0-9]*(?:/[a-zA-Z0-9_\-]*)*)["\']', content):
-            path = m.group(1)
-            # Filter out clearly non-route paths
-            if any(path.endswith(ext) for ext in ('.js', '.css', '.png', '.json', '.svg', '.ico')):
-                continue
-            if any(seg in path for seg in ('/node_modules/', '/__', '/assets/', '/static/')):
-                continue
-            if len(path) > 1 and len(path) < 100:
-                routes.add(path)
-
-        # ── Nuxt _payload.json / builds manifest ──
-        for m in re.finditer(r'"(/[a-zA-Z][a-zA-Z0-9_/\-]*)"', content):
-            path = m.group(1)
-            if not any(path.endswith(ext) for ext in ('.js', '.css', '.png', '.json', '.map')):
-                if len(path) > 1 and len(path) < 80:
-                    routes.add(path)
-
-        # ── Query parameter patterns: ?type=X&page=Y ──
-        for m in re.finditer(r'["\'](/[a-zA-Z][a-zA-Z0-9_/\-]*\?[a-zA-Z0-9_=&%\+\-\.]+)["\']', content):
-            routes.add(m.group(1))
-
-        # ── Route with dynamic segments: /detail/:id, /game/:slug ──
-        for m in re.finditer(r'["\'](/[a-zA-Z][a-zA-Z0-9_/]*(?:/:[a-zA-Z0-9_]+)+)["\']', content):
-            route = m.group(1)
-            # Replace :param with sample value
-            resolved = re.sub(r':([a-zA-Z0-9_]+)', '1', route)
-            routes.add(resolved)
-            routes.add(route)  # keep template too
-
-        # ── API endpoint patterns ──
-        api_patterns = [
-            r'["\'`](/api/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]',
-            r'(?:url|path|endpoint|baseURL)\s*[:=]\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]',
-            r'(?:fetch|axios|post|get|put|delete|patch|request)\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]',
-            r'(?:fetch|axios|post|get|put|delete|patch|request)\s*\(\s*["\'`](https?://[^\s"\'`]+)["\'`]',
-            # Concatenated API paths: baseUrl + "/game/list"
-            r'\+\s*["\'](/[a-zA-Z0-9_/\-]+)["\']',
-        ]
-        for pat in api_patterns:
-            for m in re.finditer(pat, content):
-                ep = m.group(1)
-                ep = re.sub(r'\$\{[^}]+\}', '1', ep)  # resolve template literals
-                if not any(ep.endswith(ext) for ext in ('.js', '.css', '.png')):
-                    routes.add(ep)
-
-        # ── Common query parameter names (to build full URLs later) ──
-        # Look for patterns like: params.type, query.page, ?type=
-        self._query_param_patterns = getattr(self, '_query_param_patterns', set())
-        for m in re.finditer(r'(?:params|query)\s*[\.\[]\s*["\']?([a-zA-Z0-9_]+)', content):
-            self._query_param_patterns.add(m.group(1))
-        for m in re.finditer(r'[?&]([a-zA-Z0-9_]+)=', content):
-            self._query_param_patterns.add(m.group(1))
-
-        return routes
-
-    def _expand_routes_with_params(self):
-        """Generate full URLs from routes + discovered query params"""
-        expanded = set()
-
-        # Common parameter values to try
-        param_values = {
-            'type': ['IsNew', 'IsHot', 'IsRecommend', 'all', 'slot', 'live', 'sport', 'fish', 'chess'],
-            'page': ['1'],
-            'id': ['1'],
-            'tab': ['1', '2', '3'],
-            'category': ['all', 'hot', 'new'],
-            'sort': ['new', 'hot', 'popular'],
-            'lang': ['en', 'zh'],
-            'status': ['active', 'all'],
-        }
-
-        for route in list(self.spa_routes):
-            expanded.add(route)
-
-            # If route has no query params, try adding common ones
-            if '?' not in route:
-                # Check if any discovered param names are associated with this route pattern
-                route_lower = route.lower()
-
-                # For list/category pages, add type & page params
-                if any(word in route_lower for word in ('all', 'list', 'game', 'slot', 'category', 'search')):
-                    for type_val in param_values.get('type', []):
-                        expanded.add(f"{route}?type={type_val}&page=1")
-                    expanded.add(f"{route}?page=1")
-
-                # For detail pages, add id param
-                if any(word in route_lower for word in ('detail', 'info', 'view', 'show')):
-                    expanded.add(f"{route}?id=1")
-
-        return expanded
-
-    # ─── Page Interaction (trigger SPA navigation & API calls) ────────────────
-
-    async def _extract_all_links(self, page):
-        """Extract links from DOM — handles SPA frameworks"""
-        links = set()
         try:
-            # Standard <a href>
-            hrefs = await page.evaluate('''() => {
-                return Array.from(document.querySelectorAll('a[href]'))
-                    .map(a => a.href)
-                    .filter(h => h && h.startsWith('http'));
-            }''')
-            links.update(hrefs)
+            await page.goto(self.target_url, wait_until='domcontentloaded', timeout=self.timeout * 1000)
+            try:
+                await page.wait_for_load_state('networkidle', timeout=15000)
+            except:
+                pass
+            await page.wait_for_timeout(3000)
+        except Exception as e:
+            self._log(f"Load error: {e}", "err")
 
-            # Vue router-link / nuxt-link (rendered as <a> but also check data attrs)
-            vue_links = await page.evaluate('''() => {
-                const links = [];
-                // NuxtLink / router-link
-                document.querySelectorAll('[to], [href]').forEach(el => {
-                    const to = el.getAttribute('to') || el.getAttribute('href');
-                    if (to && to.startsWith('/')) links.push(to);
-                });
-                // data-* attributes
-                document.querySelectorAll('[data-href],[data-url],[data-to],[data-link],[data-path]').forEach(el => {
-                    ['data-href','data-url','data-to','data-link','data-path'].forEach(attr => {
-                        const v = el.getAttribute(attr);
-                        if (v && (v.startsWith('/') || v.startsWith('http'))) links.push(v);
-                    });
-                });
-                return links;
-            }''')
-            for link in vue_links:
-                if link.startswith('/'):
-                    links.add(self.origin + link)
-                elif link.startswith('http'):
-                    links.add(link)
-
-            # Extract URLs from onclick, @click handlers
-            click_urls = await page.evaluate('''() => {
+        # ── Discover the CDN domain from <script> tags and <link> tags ──
+        try:
+            srcs = await page.evaluate('''() => {
                 const urls = [];
-                document.querySelectorAll('[onclick]').forEach(el => {
-                    const oc = el.getAttribute('onclick') || '';
-                    const m = oc.match(/['"](\\/[^'"]+)['"]/g);
-                    if (m) m.forEach(u => urls.push(u.replace(/['"]/g, '')));
-                });
+                document.querySelectorAll('script[src]').forEach(s => urls.push(s.src));
+                document.querySelectorAll('link[href]').forEach(l => urls.push(l.href));
                 return urls;
             }''')
-            for u in click_urls:
-                if u.startswith('/'):
-                    links.add(self.origin + u)
+            for src in srcs:
+                parsed = urlparse(src)
+                if parsed.path.endswith('.js'):
+                    self.asset_domains.add(parsed.netloc)
+                    self.js_urls.add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')))
+        except:
+            pass
 
-            # Inline script URLs
-            scripts = await page.evaluate('''() => {
-                return Array.from(document.querySelectorAll('script:not([src])'))
-                    .map(s => s.textContent).filter(Boolean);
-            }''')
-            for script in scripts:
-                for m in re.finditer(r'["\'](/[a-zA-Z][a-zA-Z0-9_/\-]*(?:\?[^"\']*)?)["\']', script):
-                    path = m.group(1)
-                    if not any(path.endswith(ext) for ext in ('.js', '.css', '.png', '.svg')):
-                        links.add(self.origin + path)
+        self._log(f"Asset domains detected: {self.asset_domains}", "ok")
+        self._log(f"JS files found: {len(self.js_urls)}", "ok")
 
-        except Exception as e:
-            self._vlog(f"Link extraction error: {e}")
+        # ── Heavy interaction to trigger API calls ──
+        self._log("Interacting with page (scroll, click tabs/nav/filters)...")
+        await self._interact(page)
 
-        return links
+        # ── Extract all links from DOM ──
+        await self._extract_dom_links(page)
 
-    async def _deep_interact(self, page):
-        """Aggressively interact with page to trigger SPA navigation & API calls"""
+        self._log(f"Network requests captured: {len(self.intercepted)}", "ok")
+        self._log(f"Routes found from DOM: {len(self.raw_routes)}", "ok")
+
+    async def _interact(self, page):
+        """Click everything interactive to trigger API calls"""
         try:
-            # ── 1. Scroll fully (lazy loading) ──
+            # Scroll
             await page.evaluate('''async () => {
-                const delay = ms => new Promise(r => setTimeout(r, ms));
-                for (let i = 0; i < 10; i++) {
+                for (let i = 0; i < 15; i++) {
                     window.scrollBy(0, window.innerHeight);
-                    await delay(300);
+                    await new Promise(r => setTimeout(r, 250));
                 }
                 window.scrollTo(0, 0);
             }''')
             await page.wait_for_timeout(1000)
 
-            # ── 2. Click navigation items / tabs / filters ──
-            click_selectors = [
-                # Navigation
-                'nav a', '.nav a', '.nav-item', '.nav-link', '.menu-item a',
-                'header a', '.header a', '.sidebar a',
-                # Tabs & filters
-                '[role="tab"]', '.tab', '.tab-item', '[data-toggle="tab"]',
+            # Click selectors
+            selectors = [
+                'nav a', '.nav a', '.nav-item', '.nav-link', 'header a',
+                '.sidebar a', '[role="tab"]', '.tab', '.tab-item',
                 '[class*="tab"]', '[class*="filter"]', '[class*="category"]',
-                # Buttons that trigger content
-                'button[data-type]', 'a[data-type]', '[data-category]',
-                '[class*="sort"]', '[class*="type"]',
-                # Pagination
-                '.pagination a', '.pagination button', '[class*="pager"] a',
-                'a[href*="page="]', 'button[data-page]',
-                '[class*="page"]  a', '[class*="next"]', '[class*="more"]',
-                # Vue/Nuxt specific
-                '.nuxt-link-active', '[class*="router"]',
-                # Game/content cards (clicking might navigate)
-                '.game-item a', '.card a', '[class*="card"] a',
-                '[class*="game"] a', '[class*="item"] a',
-                # Footer links
-                'footer a',
+                '[class*="menu"] a', '[class*="nav"] a',
+                'button[data-type]', '[data-category]', '[class*="sort"]',
+                '.pagination a', '.pagination button', '[class*="page"] a',
+                'a[href*="page="]', '[class*="next"]', '[class*="more"]',
+                'footer a', '.game-item a', '.card a', '[class*="card"] a',
             ]
 
             clicked = set()
-            for selector in click_selectors:
+            for sel in selectors:
                 try:
-                    elements = await page.query_selector_all(selector)
-                    for el in elements[:15]:
+                    els = await page.query_selector_all(sel)
+                    for el in els[:12]:
                         try:
-                            # Get a unique identifier
-                            tag_info = await page.evaluate('''(el) => {
-                                const href = el.getAttribute('href') || el.getAttribute('to') || '';
-                                const text = (el.textContent || '').trim().substring(0, 30);
-                                return href + '|' + text;
-                            }''', el)
-
-                            if tag_info in clicked:
+                            ident = await page.evaluate(
+                                '(el) => (el.getAttribute("href")||"") + "|" + (el.textContent||"").trim().slice(0,20)', el)
+                            if ident in clicked:
                                 continue
-                            clicked.add(tag_info)
-
-                            visible = await el.is_visible()
-                            if not visible:
+                            clicked.add(ident)
+                            if not await el.is_visible():
                                 continue
 
-                            # Check if it's a navigation link
-                            href = await page.evaluate('(el) => el.getAttribute("href") || el.getAttribute("to") || ""', el)
-                            if href and href.startswith('/'):
-                                # This is a SPA route — record it
-                                self.spa_routes.add(href)
-                                full_url = self.origin + href
-                                if full_url not in self.visited_pages:
-                                    self.visited_pages.add(full_url)
+                            # Capture href/to as route
+                            href = await page.evaluate(
+                                '(el) => el.getAttribute("href") || el.getAttribute("to") || ""', el)
+                            if href and href.startswith('/') and not href.endswith(('.js', '.css', '.png')):
+                                self.raw_routes.add(href)
 
-                            # Click it to trigger API calls
-                            await el.click(timeout=3000)
-                            await page.wait_for_timeout(800)
+                            await el.click(timeout=2500)
+                            await page.wait_for_timeout(600)
 
-                            # Record current URL (SPA might have changed it)
-                            current = page.url
-                            if current and self._is_same_scope(current):
-                                self.intercepted_urls.add(current)
-                                parsed = urlparse(current)
-                                if parsed.path != '/':
-                                    self.spa_routes.add(parsed.path + ('?' + parsed.query if parsed.query else ''))
-
-                        except Exception:
+                            # Record URL after SPA navigation
+                            cur = page.url
+                            if self._is_target_scope(cur):
+                                p = urlparse(cur)
+                                route = p.path + ('?' + p.query if p.query else '')
+                                self.raw_routes.add(route)
+                        except:
                             pass
-                except Exception:
+                except:
+                    pass
+        except Exception as e:
+            self._vlog(f"Interact error: {e}")
+
+    async def _extract_dom_links(self, page):
+        """Extract all link-like things from DOM"""
+        try:
+            results = await page.evaluate('''() => {
+                const links = new Set();
+                // <a href>, <a to> (Vue/Nuxt)
+                document.querySelectorAll('a[href], [to]').forEach(el => {
+                    const v = el.getAttribute('href') || el.getAttribute('to') || '';
+                    if (v.startsWith('/') || v.startsWith('http')) links.add(v);
+                });
+                // data attributes
+                document.querySelectorAll('[data-href],[data-url],[data-to],[data-path],[data-link]').forEach(el => {
+                    for (const attr of ['data-href','data-url','data-to','data-path','data-link']) {
+                        const v = el.getAttribute(attr);
+                        if (v && (v.startsWith('/') || v.startsWith('http'))) links.add(v);
+                    }
+                });
+                // inline scripts
+                document.querySelectorAll('script:not([src])').forEach(s => {
+                    const t = s.textContent || '';
+                    const ms = t.match(/["']\\/[a-zA-Z][^"'\\s]{1,120}["']/g);
+                    if (ms) ms.forEach(m => links.add(m.replace(/["']/g, '')));
+                });
+                return Array.from(links);
+            }''')
+
+            for link in results:
+                if link.startswith('/'):
+                    if not any(link.endswith(ext) for ext in ('.js', '.css', '.png', '.svg', '.ico', '.json')):
+                        self.raw_routes.add(link)
+                elif link.startswith('http') and self._is_target_scope(link):
+                    p = urlparse(link)
+                    route = p.path + ('?' + p.query if p.query else '')
+                    if not any(route.endswith(ext) for ext in ('.js', '.css', '.png', '.svg', '.ico')):
+                        self.raw_routes.add(route)
+        except Exception as e:
+            self._vlog(f"DOM link error: {e}")
+
+    # ── Phase 2: Download ALL JS chunks (including CDN) ──────────────────────
+
+    async def _phase2_download_all_js(self, page):
+        """Download every JS file — from target AND CDN domains"""
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 2: Download ALL JS Chunks ═══{C.END}\n")
+
+        # First, try to get the Nuxt build manifest to find ALL chunks
+        await self._discover_nuxt_chunks(page)
+
+        self._log(f"Total JS files to download: {len(self.js_urls)}", "info")
+
+        # Download in passes (JS files can reference more JS files)
+        for pass_num in range(1, 6):
+            to_dl = [u for u in self.js_urls if u not in self.js_content]
+            if not to_dl:
+                break
+
+            self._log(f"Pass {pass_num}: downloading {len(to_dl)} JS files...", "warn")
+
+            for i, url in enumerate(sorted(to_dl), 1):
+                try:
+                    resp = await page.goto(url, wait_until='load', timeout=12000)
+                    if resp and resp.status == 200:
+                        content = await resp.text()
+                        if content and len(content) > 10:
+                            self.js_content[url] = content
+
+                            # Save
+                            fname = re.sub(r'[^\w\-.]', '_', url.split('/')[-1])[:120]
+                            with open(os.path.join(self.output_dir, "js_files", fname), 'w',
+                                      encoding='utf-8', errors='ignore') as f:
+                                f.write(content)
+
+                            # Find more JS refs inside this file
+                            self._find_js_refs(url, content)
+
+                            if self.verbose and i % 10 == 0:
+                                print(f"    {C.DIM}[{i}/{len(to_dl)}] downloaded...{C.END}")
+                except:
                     pass
 
-            # ── 3. Extract URLs from the current DOM after all interactions ──
-            try:
-                all_urls = await page.evaluate('''() => {
-                    const urls = new Set();
-                    // All anchor hrefs
-                    document.querySelectorAll('a').forEach(a => {
-                        if (a.href) urls.add(a.href);
-                        const to = a.getAttribute('to');
-                        if (to) urls.add(to);
-                    });
-                    // All URLs in text content of script tags
-                    document.querySelectorAll('script').forEach(s => {
-                        const text = s.textContent || '';
-                        const matches = text.match(/["']\\/[a-zA-Z][^"'\\s]{1,80}["']/g);
-                        if (matches) matches.forEach(m => urls.add(m.replace(/["']/g, '')));
-                    });
-                    return Array.from(urls);
-                }''')
-                for u in all_urls:
-                    if u.startswith('/') and len(u) > 1:
-                        if not any(u.endswith(ext) for ext in ('.js', '.css', '.png', '.svg', '.ico')):
-                            self.spa_routes.add(u)
-                    elif u.startswith('http') and self._is_same_scope(u):
-                        self.intercepted_urls.add(u)
-                        parsed = urlparse(u)
-                        if parsed.path and parsed.path != '/':
-                            self.spa_routes.add(parsed.path + ('?' + parsed.query if parsed.query else ''))
-            except Exception:
-                pass
+            new_count = len([u for u in self.js_urls if u not in self.js_content])
+            self._log(f"Pass {pass_num} done. Cached: {len(self.js_content)}. Remaining: {new_count}", "ok")
+            if new_count == 0:
+                break
 
-        except Exception as e:
-            self._vlog(f"Interaction error: {e}")
+        self._log(f"Total JS downloaded: {len(self.js_content)}/{len(self.js_urls)}", "ok")
 
-    async def _navigate_spa_route(self, page, route):
-        """Navigate to a SPA route by changing the URL directly"""
-        full_url = self.origin + route if route.startswith('/') else route
-        if full_url in self.visited_pages:
-            return
+    async def _discover_nuxt_chunks(self, page):
+        """Parse Nuxt build manifest to find ALL JS chunk URLs"""
+        # The CDN domain is where _nuxt lives
+        cdn_origins = set()
+        for domain in self.asset_domains:
+            for scheme in ['https']:
+                cdn_origins.add(f"{scheme}://{domain}")
 
-        self.visited_pages.add(full_url)
-
-        try:
-            # For SPAs, we navigate using the router or direct URL
-            await page.goto(full_url, wait_until='domcontentloaded', timeout=15000)
-            try:
-                await page.wait_for_load_state('networkidle', timeout=8000)
-            except:
-                pass
-            await page.wait_for_timeout(1500)
-
-            # Extract more links from this page
-            links = await self._extract_all_links(page)
-            for link in links:
-                if self._is_same_scope(link):
-                    parsed = urlparse(link)
-                    if parsed.path and parsed.path != '/':
-                        route_path = parsed.path + ('?' + parsed.query if parsed.query else '')
-                        self.spa_routes.add(route_path)
-
-        except Exception as e:
-            self._vlog(f"SPA nav error {route}: {str(e)[:50]}")
-
-    # ─── JS Analysis ─────────────────────────────────────────────────────────
-
-    async def _download_js_files(self, page):
-        """Download all discovered JS files"""
-        to_download = [u for u in self.js_files if u not in self.js_content_cache]
-        if not to_download:
-            return
-
-        self._log(f"Downloading {len(to_download)} JS files...", "warn")
-
-        for i, url in enumerate(sorted(to_download), 1):
-            try:
-                resp = await page.goto(url, wait_until='load', timeout=15000)
-                if resp and resp.status == 200:
-                    content = await resp.text()
-                    self.js_content_cache[url] = content
-
-                    fname = re.sub(r'[^\w\-.]', '_', url.split('/')[-1])[:100]
-                    fpath = os.path.join(self.output_dir, "js_files", fname)
-                    with open(fpath, 'w', encoding='utf-8', errors='ignore') as f:
-                        f.write(content)
-
-                    self._vlog(f"  [{i:03d}] ✓ {url[:80]}")
-            except Exception:
-                pass
-
-        self._log(f"Downloaded: {len(self.js_content_cache)}/{len(self.js_files)}", "ok")
-
-    async def _fetch_nuxt_manifest(self, page):
-        """Try to fetch Nuxt build manifest which lists all routes and chunks"""
+        # Try manifest endpoints
         manifest_paths = [
             '/_nuxt/builds/latest.json',
             '/_payload.json',
-            '/__nuxt_island/',
         ]
 
-        for path in manifest_paths:
-            try:
-                url = self.origin + path
-                resp = await page.goto(url, wait_until='load', timeout=8000)
-                if resp and resp.status == 200:
-                    content = await resp.text()
-                    self._vlog(f"Found manifest: {path}")
-                    # Extract all referenced JS chunks
-                    for m in re.finditer(r'["\'](/[^"\']*\.js)["\']', content):
-                        js_url = self.origin + m.group(1)
-                        self.js_files.add(js_url)
-                    # Extract route info
-                    routes = self._extract_spa_routes(content, url)
-                    self.spa_routes.update(routes)
-            except Exception:
-                pass
-
-        # Also try to find the Nuxt build meta JSON from intercepted requests
-        for req in self.intercepted_requests:
+        # Also check intercepted requests for build meta URLs
+        for req in self.intercepted:
             if '_nuxt/builds/meta' in req['url']:
                 try:
                     resp = await page.goto(req['url'], wait_until='load', timeout=8000)
                     if resp and resp.status == 200:
-                        content = await resp.text()
-                        for m in re.finditer(r'["\'](/[^"\']*\.js)["\']', content):
-                            self.js_files.add(self.origin + m.group(1))
-                except Exception:
+                        text = await resp.text()
+                        self._extract_chunk_urls_from_json(text, req['url'])
+                except:
                     pass
 
-    def _analyze_js_content(self, url, content):
-        """Analyze JS: routes, endpoints, secrets, more JS refs"""
-        if url in self.analyzed_js:
-            return 0
-        self.analyzed_js.add(url)
+        # Check the Nuxt build meta from all known CDN domains too
+        for req_data in list(self.intercepted):
+            url = req_data['url']
+            if '_nuxt' in url and url.endswith('.json'):
+                try:
+                    resp = await page.goto(url, wait_until='load', timeout=8000)
+                    if resp and resp.status == 200:
+                        text = await resp.text()
+                        self._extract_chunk_urls_from_json(text, url)
+                except:
+                    pass
 
-        if HAS_BEAUTIFIER:
-            try:
-                opts = jsbeautifier.default_options()
-                opts.indent_size = 2
-                content = jsbeautifier.beautify(content, opts)
-            except:
-                pass
+        for cdn_origin in cdn_origins:
+            for path in manifest_paths:
+                try:
+                    url = cdn_origin + path
+                    resp = await page.goto(url, wait_until='load', timeout=8000)
+                    if resp and resp.status == 200:
+                        text = await resp.text()
+                        self._extract_chunk_urls_from_json(text, url)
+                        self._vlog(f"Found manifest: {url}")
+                except:
+                    pass
 
-        # ── Extract SPA routes ──
-        routes = self._extract_spa_routes(content, url)
-        self.spa_routes.update(routes)
+        # Brute-find JS chunk patterns from HTML source
+        try:
+            await page.goto(self.target_url, wait_until='domcontentloaded', timeout=15000)
+            html = await page.content()
+            # Find all JS references in HTML
+            for m in re.finditer(r'(?:src|href)\s*=\s*["\']((?:https?://)?[^"\']*\.js(?:\?[^"\']*)?)["\']', html):
+                js_ref = m.group(1)
+                if js_ref.startswith('//'):
+                    js_ref = 'https:' + js_ref
+                elif js_ref.startswith('/'):
+                    # Could be on any CDN origin
+                    for cdn in cdn_origins:
+                        self.js_urls.add(cdn + js_ref.split('?')[0])
+                    self.js_urls.add(self.origin + js_ref.split('?')[0])
+                elif js_ref.startswith('http'):
+                    self.js_urls.add(js_ref.split('?')[0])
+        except:
+            pass
 
-        # ── Extract API endpoints with context ──
-        found = 0
-        ep_patterns = [
-            r'["\'`](/api/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]',
-            r'["\'`](/[a-zA-Z][a-zA-Z0-9_\-]*/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]',
-            r'(?:url|path|endpoint|baseURL|href)\s*[:=]\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]',
-            r'(?:fetch|axios|post|get|put|delete|patch|request|\$http)\s*[\.(]\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]',
-            r'(?:fetch|axios|post|get|put|delete|patch|request|\$http)\s*[\.(]\s*["\'`](https?://[^\s"\'`]+)["\'`]',
-            r'\+\s*["\'](/api/[a-zA-Z0-9_/\-]+)["\']',
-            r'["\'`](/[a-zA-Z][a-zA-Z0-9_/\-]*\?[a-zA-Z0-9_=&%\+\-\.]+)["\'`]',
-        ]
+        self._log(f"After manifest scan: {len(self.js_urls)} JS files known", "ok")
 
-        for pat in ep_patterns:
-            for m in re.finditer(pat, content):
-                endpoint = m.group(1)
-                if any(endpoint.lower().endswith(ext) for ext in
-                       ('.js', '.css', '.png', '.jpg', '.gif', '.svg', '.ico', '.woff', '.map', '.json')):
-                    continue
+    def _extract_chunk_urls_from_json(self, text, base_url):
+        """Extract JS chunk URLs from Nuxt manifest JSON"""
+        parsed_base = urlparse(base_url)
+        base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
-                endpoint = re.sub(r'\$\{[^}]+\}', '1', endpoint)  # resolve template literals
+        # Find all .js references
+        for m in re.finditer(r'["\']([^"\']*\.(?:js|mjs))["\']', text):
+            ref = m.group(1)
+            if ref.startswith('http'):
+                self.js_urls.add(ref.split('?')[0])
+            elif ref.startswith('/'):
+                self.js_urls.add(base_origin + ref.split('?')[0])
+            elif ref.startswith('./') or not ref.startswith('.'):
+                # Relative to base
+                base_dir = '/'.join(base_url.split('/')[:-1])
+                full = base_dir + '/' + ref.lstrip('./')
+                self.js_urls.add(full.split('?')[0])
 
-                # Context
-                start = max(0, m.start() - 800)
-                end = min(len(content), m.end() + 800)
-                context = content[start:end]
+    def _find_js_refs(self, base_url, content):
+        """Find references to other JS files within JS content"""
+        parsed_base = urlparse(base_url)
+        base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
-                method = self._detect_method(endpoint, context)
-                ct = self._detect_content_type(context) if method in ('POST', 'PUT', 'PATCH') else None
-                params = self._extract_params(endpoint, context)
-
-                if endpoint.startswith("http"):
-                    full_url = endpoint
-                else:
-                    full_url = self.origin + endpoint
-
-                self.js_extracted_endpoints.append({
-                    'endpoint': endpoint,
-                    'full_url': full_url,
-                    'method': method,
-                    'content_type': ct,
-                    'params': params,
-                    'source_js': url,
-                })
-                found += 1
-
-        # ── Secrets ──
-        for sec_type, patterns in self.secret_patterns.items():
-            for pattern in patterns:
-                for m in re.finditer(pattern, content, re.I):
-                    val = m.group(1) if m.groups() else m.group(0)
-                    if val and len(val) >= 8:
-                        skip = ('placeholder', 'example', 'test', 'xxx', 'null', 'undefined')
-                        if not any(s in val.lower() for s in skip):
-                            ctx_start = max(0, m.start() - 80)
-                            ctx_end = min(len(content), m.end() + 80)
-                            self.js_extracted_secrets.append({
-                                'type': sec_type,
-                                'value': val,
-                                'file': url,
-                                'context': content[ctx_start:ctx_end].replace('\n', ' ')[:300],
-                            })
-
-        # ── Find more JS file references ──
-        js_ref_patterns = [
+        patterns = [
             r'import\s*\(\s*["\']([^"\']+\.js)["\']',
             r'import\s+.*?\s+from\s+["\']([^"\']+\.js)["\']',
-            r'require\s*\(\s*["\']([^"\']+\.js)["\']',
             r'["\']([^"\']*?[a-zA-Z0-9_\-]+\.[a-f0-9]{6,}\.js)["\']',
-            r'["\']([^"\']*?_nuxt/[a-zA-Z0-9_\-/\.]+\.js)["\']',
-            r'["\']([^"\']*?assets/[a-zA-Z0-9_\-\.]+\.js)["\']',
-            r'["\'](/[a-zA-Z0-9_\-/]+\.js)["\']',
-            # Webpack chunk loading
-            r'["\']((?:https?://)?[^"\']*?\.chunk\.js)["\']',
-            r'["\']([^"\']+\.module\.js)["\']',
+            r'["\']([^"\']*?_nuxt/[^\s"\']*\.js)["\']',
+            r'["\']([^"\']*?assets/[^\s"\']*\.js)["\']',
+            r'["\'](/[a-zA-Z0-9_\-/.]+\.js)["\']',
+            # Webpack/Vite chunk patterns
+            r'["\']((?:\./|\.\./)[\w\-/]+\.js)["\']',
+            r'["\']([a-zA-Z0-9_\-]+\.[a-f0-9]{6,8}\.js)["\']',
         ]
-        for pat in js_ref_patterns:
+
+        for pat in patterns:
             for m in re.finditer(pat, content):
                 ref = m.group(1)
                 if ref.startswith('http'):
-                    if self._is_same_scope(ref):
-                        parsed = urlparse(ref)
-                        self.js_files.add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')))
+                    p = urlparse(ref)
+                    if p.netloc in self.asset_domains:
+                        self.js_urls.add(ref.split('?')[0])
+                elif ref.startswith('/'):
+                    self.js_urls.add(base_origin + ref)
                 else:
-                    try:
-                        full = urljoin(url, ref)
-                        if self._is_same_scope(full):
-                            parsed = urlparse(full)
-                            self.js_files.add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')))
-                    except:
-                        pass
+                    base_dir = '/'.join(base_url.split('/')[:-1])
+                    full = base_dir + '/' + ref.lstrip('./')
+                    self.js_urls.add(full.split('?')[0])
 
-        return found
+    # ── Phase 3: Analyze ALL JS — extract routes + params TOGETHER ───────────
+
+    def _phase3_analyze_js(self):
+        """The core: analyze every JS file, extract route+param pairs"""
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 3: Deep JS Analysis (Routes + Params) ═══{C.END}\n")
+
+        total_routes = 0
+        total_apis = 0
+
+        for url, content in self.js_content.items():
+            if url in self.analyzed_js:
+                continue
+            self.analyzed_js.add(url)
+
+            # Optionally beautify
+            if HAS_BEAUTIFIER and len(content) < 2_000_000:
+                try:
+                    opts = jsbeautifier.default_options()
+                    opts.indent_size = 2
+                    content = jsbeautifier.beautify(content, opts)
+                except:
+                    pass
+
+            r, a = self._analyze_single_js(url, content)
+            total_routes += r
+            total_apis += a
+
+        self._log(f"Routes extracted: {total_routes}", "ok")
+        self._log(f"API endpoints extracted: {total_apis}", "ok")
+        self._log(f"Query param names found: {self.query_param_names}", "ok")
+
+    def _analyze_single_js(self, url, content):
+        """Analyze one JS file — find routes, API endpoints, params, secrets"""
+        route_count = 0
+        api_count = 0
+
+        # ══════════════════════════════════════════════════════════════
+        # 1. ROUTE + PARAM EXTRACTION (the key improvement)
+        # ══════════════════════════════════════════════════════════════
+
+        # ── Vue Router / Nuxt path definitions ──
+        # Match: path: "/detail/helpCenter", path: "/all", path: "/roulette"
+        for m in re.finditer(r'path\s*:\s*["\'](/[a-zA-Z0-9_/\-:.*?]*)["\']', content):
+            route = m.group(1)
+            if len(route) < 2 or route.endswith(('.js', '.css', '.png', '.json')):
+                continue
+
+            # Get wide context around this route to find associated params
+            ctx_start = max(0, m.start() - 2000)
+            ctx_end = min(len(content), m.end() + 2000)
+            context = content[ctx_start:ctx_end]
+
+            # Extract query params from context
+            params = self._extract_params_from_context(context)
+
+            # Resolve dynamic segments: /detail/:id → /detail/1
+            resolved = self._resolve_dynamic(route)
+
+            self.raw_routes.add(resolved)
+            if params:
+                self.route_param_pairs.append({
+                    'route': resolved,
+                    'raw_route': route,
+                    'params': params,
+                    'method': 'GET',
+                    'source': url,
+                })
+            route_count += 1
+
+        # ── Nuxt route name → path conversion ──
+        # name: "detail-helpCenter", name: "all", name: "roulette"
+        for m in re.finditer(r'(?:name|component)\s*:\s*["\']([a-zA-Z][a-zA-Z0-9_\-]+)["\']', content):
+            name = m.group(1)
+            # Skip common non-route names
+            if name in ('default', 'index', 'error', 'layout', 'app', 'head', 'body',
+                        'script', 'style', 'template', 'slot', 'transition'):
+                continue
+            # Convert name to path: "detail-helpCenter" → "/detail/helpCenter"
+            path = "/" + name.replace("---", "/").replace("--", "/").replace("-", "/")
+            # Also try keeping hyphens for some
+            path_hyphen = "/" + name
+
+            ctx_start = max(0, m.start() - 2000)
+            ctx_end = min(len(content), m.end() + 2000)
+            context = content[ctx_start:ctx_end]
+            params = self._extract_params_from_context(context)
+
+            self.raw_routes.add(path)
+            self.raw_routes.add(path_hyphen)
+            if params:
+                self.route_param_pairs.append({
+                    'route': path, 'params': params, 'method': 'GET', 'source': url,
+                })
+            route_count += 1
+
+        # ── Direct path strings with query params ──
+        # "/all?type=IsNew&page=1", "/roulette?page=1&name=f"
+        for m in re.finditer(r'["\'`](/[a-zA-Z][a-zA-Z0-9_/\-]*\?[a-zA-Z0-9_=&%\+\-\.]+)["\'`]', content):
+            full_path = m.group(1)
+            path_part = full_path.split('?')[0]
+            query_part = full_path.split('?')[1] if '?' in full_path else ''
+
+            params = {}
+            for kv in query_part.split('&'):
+                if '=' in kv:
+                    k, v = kv.split('=', 1)
+                    params[k] = v
+
+            self.raw_routes.add(path_part)
+            if params:
+                self.route_param_pairs.append({
+                    'route': path_part, 'params': params, 'method': 'GET', 'source': url,
+                })
+            route_count += 1
+
+        # ── All /path strings that look like routes ──
+        for m in re.finditer(r'["\'](/[a-z][a-zA-Z0-9]*(?:/[a-zA-Z0-9_\-]*)*)["\']', content):
+            path = m.group(1)
+            if any(path.endswith(ext) for ext in ('.js', '.css', '.png', '.json', '.svg', '.ico', '.map')):
+                continue
+            if any(seg in path for seg in ('node_modules', '__', 'assets/', 'static/', '_nuxt')):
+                continue
+            if len(path) > 1 and len(path) < 80:
+                self.raw_routes.add(path)
+                route_count += 1
+
+        # ══════════════════════════════════════════════════════════════
+        # 2. API ENDPOINTS
+        # ══════════════════════════════════════════════════════════════
+
+        api_patterns = [
+            (r'["\'`](/api/[a-zA-Z0-9_/\-{}:?=&\.\+%]+)["\'`]', None),
+            (r'\.post\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'POST'),
+            (r'\.get\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'GET'),
+            (r'\.put\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'PUT'),
+            (r'\.delete\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'DELETE'),
+            (r'\.patch\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', 'PATCH'),
+            (r'(?:fetch|axios|request|\$http)\s*\(\s*["\'`](/[a-zA-Z0-9_/\-{}:?=&]+)["\'`]', None),
+            (r'(?:url|endpoint|baseURL|apiUrl)\s*[:=]\s*["\'`](/api[a-zA-Z0-9_/\-{}:?=&]*)["\']', None),
+            (r'\+\s*["\'](/api/[a-zA-Z0-9_/\-]+)["\']', None),
+        ]
+
+        for pat, forced_method in api_patterns:
+            for m in re.finditer(pat, content):
+                endpoint = m.group(1)
+                endpoint = re.sub(r'\$\{[^}]+\}', '1', endpoint)
+
+                if any(endpoint.endswith(ext) for ext in ('.js', '.css', '.png')):
+                    continue
+
+                ctx_start = max(0, m.start() - 1000)
+                ctx_end = min(len(content), m.end() + 1000)
+                context = content[ctx_start:ctx_end]
+
+                method = forced_method or self._detect_method(endpoint, context)
+                params = self._extract_params_from_context(context)
+                body_params = self._extract_body_params(context) if method in ('POST', 'PUT', 'PATCH') else []
+
+                self.raw_api_endpoints.add(endpoint)
+                self.route_param_pairs.append({
+                    'route': endpoint,
+                    'params': params,
+                    'body_params': body_params,
+                    'method': method,
+                    'source': url,
+                })
+                api_count += 1
+
+        # ══════════════════════════════════════════════════════════════
+        # 3. GLOBAL QUERY PARAM NAMES
+        # ══════════════════════════════════════════════════════════════
+
+        # query.page, params.type, route.query.id, etc.
+        for m in re.finditer(r'(?:query|params|searchParams)\s*[\.\[]\s*["\']?(\w+)', content):
+            name = m.group(1)
+            if name not in ('length', 'toString', 'constructor', 'prototype', 'value',
+                           'key', 'default', 'get', 'set', 'has', 'delete'):
+                self.query_param_names.add(name)
+
+        # ?param= patterns
+        for m in re.finditer(r'[?&]([a-zA-Z_]\w{0,20})=', content):
+            self.query_param_names.add(m.group(1))
+
+        # ══════════════════════════════════════════════════════════════
+        # 4. SECRETS
+        # ══════════════════════════════════════════════════════════════
+        for sec_type, patterns in self.secret_patterns.items():
+            for pat in patterns:
+                for m in re.finditer(pat, content, re.I):
+                    val = m.group(1) if m.groups() else m.group(0)
+                    if val and len(val) >= 8:
+                        skip = ('placeholder', 'example', 'test', 'xxx', 'null', 'undefined', 'localhost')
+                        if not any(s in val.lower() for s in skip):
+                            cs = max(0, m.start() - 60)
+                            ce = min(len(content), m.end() + 60)
+                            self.secrets.append({
+                                'type': sec_type, 'value': val, 'file': url,
+                                'context': content[cs:ce].replace('\n', ' ')[:250],
+                            })
+
+        return route_count, api_count
+
+    def _extract_params_from_context(self, context):
+        """Extract query parameter names+sample values from surrounding JS context"""
+        params = {}
+
+        # Direct query strings: ?type=IsNew&page=1
+        for m in re.finditer(r'[?&]([a-zA-Z_]\w{0,20})=([a-zA-Z0-9_\-\.%+]*)', context):
+            k, v = m.group(1), m.group(2)
+            if k not in params:
+                params[k] = v if v else self._guess_param_value(k)
+
+        # Object properties used as query: { type: "IsNew", page: 1 }
+        # params: { type: xxx, page: xxx }
+        for m in re.finditer(r'(?:query|params|searchParams)\s*[:=]?\s*\{([^}]{1,800})\}', context):
+            obj = m.group(1)
+            for km in re.finditer(r'([a-zA-Z_]\w{0,20})\s*:', obj):
+                k = km.group(1)
+                if k not in ('type', 'default', 'required', 'validator') or k == 'type':
+                    # Try to find the value
+                    val_match = re.search(rf'{re.escape(k)}\s*:\s*["\'`]?([a-zA-Z0-9_\-\.]+)', obj)
+                    val = val_match.group(1) if val_match else self._guess_param_value(k)
+                    if k not in params:
+                        params[k] = val
+
+        # route.query.xxx patterns
+        for m in re.finditer(r'(?:route|router|query|params)\s*\.\s*(?:query\s*\.\s*)?([a-zA-Z_]\w{0,20})', context):
+            k = m.group(1)
+            if k not in ('push', 'replace', 'go', 'back', 'forward', 'resolve',
+                        'value', 'path', 'name', 'hash', 'matched', 'fullPath',
+                        'params', 'query', 'meta', 'redirectedFrom'):
+                if k not in params:
+                    params[k] = self._guess_param_value(k)
+
+        # Also record globally
+        self.query_param_names.update(params.keys())
+
+        return params
+
+    def _extract_body_params(self, context):
+        """Extract POST body parameter names"""
+        params = []
+        for pat in [r'(?:data|body|payload)\s*[:=]\s*\{([^}]{1,800})\}',
+                    r'JSON\.stringify\s*\(\s*\{([^}]{1,800})\}']:
+            for m in re.findall(pat, context, re.I):
+                for km in re.finditer(r'([a-zA-Z_]\w{0,20})\s*:', m):
+                    params.append(km.group(1))
+        return list(set(params))
+
+    def _resolve_dynamic(self, route):
+        """Resolve dynamic route segments: /detail/:id → /detail/1"""
+        route = re.sub(r':([a-zA-Z_]\w*)', lambda m: str(self._guess_param_value(m.group(1))), route)
+        route = re.sub(r'\{([a-zA-Z_]\w*)\}', lambda m: str(self._guess_param_value(m.group(1))), route)
+        # Remove Nuxt catch-all: /path/(.*) or /path/*
+        route = re.sub(r'/\(\.\*\)$', '', route)
+        route = re.sub(r'/\*$', '', route)
+        return route
 
     def _detect_method(self, endpoint, context):
         ctx = context.lower()
         for pat, meth in [
             (r'\.post\s*\(', 'POST'), (r'\.put\s*\(', 'PUT'), (r'\.delete\s*\(', 'DELETE'),
-            (r'\.patch\s*\(', 'PATCH'), (r'\.get\s*\(', 'GET'),
-            (r'method\s*[:=]\s*["\']post', 'POST'), (r'method\s*[:=]\s*["\']put', 'PUT'),
-            (r'method\s*[:=]\s*["\']delete', 'DELETE'), (r'method\s*[:=]\s*["\']get', 'GET'),
+            (r'\.patch\s*\(', 'PATCH'), (r'method\s*[:=]\s*["\']post', 'POST'),
+            (r'method\s*[:=]\s*["\']put', 'PUT'), (r'method\s*[:=]\s*["\']delete', 'DELETE'),
         ]:
             if re.search(pat, ctx):
                 return meth
-
-        ep_lower = endpoint.lower()
-        if any(w in ep_lower for w in ('create', 'add', 'register', 'login', 'signup', 'upload', 'submit', 'save')):
+        ep = endpoint.lower()
+        if any(w in ep for w in ('create', 'add', 'register', 'login', 'signup', 'upload', 'submit', 'save')):
             return 'POST'
-        if any(w in ep_lower for w in ('update', 'edit', 'modify')):
+        if any(w in ep for w in ('update', 'edit', 'modify')):
             return 'PUT'
-        if any(w in ep_lower for w in ('delete', 'remove')):
+        if any(w in ep for w in ('delete', 'remove')):
             return 'DELETE'
         return 'GET'
 
-    def _detect_content_type(self, context):
-        ctx = context.lower()
-        if 'multipart/form-data' in ctx or 'formdata' in ctx:
-            return 'multipart/form-data'
-        if 'urlencoded' in ctx:
-            return 'application/x-www-form-urlencoded'
-        return 'application/json'
+    def _guess_param_value(self, name):
+        """Generate ONE sample value for a parameter"""
+        n = name.lower()
+        if n in ('id', 'uid', 'gid', 'pid'): return 1
+        if n == 'page': return 1
+        if n == 'type': return 'IsNew'
+        if n == 'name': return 'test'
+        if n in ('limit', 'size', 'pageSize', 'per_page'): return 20
+        if n == 'sort': return 'new'
+        if n in ('status', 'state'): return 'active'
+        if n in ('lang', 'language', 'locale'): return 'en'
+        if n in ('category', 'cat'): return 'all'
+        if n == 'tab': return 1
+        if n in ('keyword', 'search', 'q'): return 'test'
+        if n == 'email': return 'test@test.com'
+        if n in ('token', 'access_token'): return 'TOKEN'
+        if n == 'origin': return 'web'
+        if n == 'platform': return 'pc'
+        if 'date' in n: return '2024-01-01'
+        if 'time' in n: return '1704067200'
+        if 'url' in n: return 'https://example.com'
+        if 'num' in n or 'count' in n: return 10
+        return 'test'
 
-    def _extract_params(self, endpoint, context):
-        params = {'path': [], 'query': [], 'body': [], 'all': []}
-        params['path'] = list(set(re.findall(r'[{:]([a-zA-Z0-9_]+)[}]?', endpoint)))
-        if '?' in endpoint:
-            q = endpoint.split('?', 1)[1]
-            params['query'] = list(set(re.findall(r'([a-zA-Z0-9_]+)=', q)))
-        for pat in [r'(?:data|body|payload|params)\s*[:=]\s*\{([^}]{1,500})\}']:
-            for m in re.findall(pat, context, re.I):
-                params['body'].extend(re.findall(r'([a-zA-Z0-9_]+)\s*:', m))
-        params['body'] = list(set(params['body']))
-        params['all'] = sorted(set(params['path'] + params['query'] + params['body']))
-        return params
+    # ── Phase 4: Visit SPA routes to trigger more API calls ──────────────────
 
-    # ─── Process & Organize ──────────────────────────────────────────────────
+    async def _phase4_visit_routes(self, page):
+        """Visit discovered SPA routes to trigger their API calls"""
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 4: Visit SPA Routes (trigger APIs) ═══{C.END}\n")
 
-    def _process_all(self):
-        """Organize everything into GET/POST/OTHER"""
+        # Navigate back to target first
+        try:
+            await page.goto(self.target_url, wait_until='domcontentloaded', timeout=15000)
+            await page.wait_for_timeout(2000)
+        except:
+            pass
 
-        # 1. Process network-intercepted requests
-        for req in self.intercepted_requests:
+        # Prioritize interesting routes
+        priority = ['all', 'game', 'slot', 'live', 'sport', 'vip', 'promotion', 'help',
+                    'detail', 'user', 'account', 'wallet', 'deposit', 'withdraw',
+                    'history', 'record', 'rank', 'agent', 'referral', 'roulette',
+                    'lottery', 'wheel', 'bonus', 'rebate', 'invite', 'message']
+
+        routes = sorted(self.raw_routes)
+        pri_routes = [r for r in routes if any(kw in r.lower() for kw in priority)]
+        other_routes = [r for r in routes if r not in pri_routes]
+        ordered = pri_routes + other_routes
+
+        visited = set()
+        count = 0
+        for route in ordered:
+            if count >= self.max_pages:
+                break
+            # Clean route
+            if route.startswith('http'):
+                if not self._is_target_scope(route):
+                    continue
+                path = urlparse(route).path
+            else:
+                path = route.split('?')[0]
+
+            if path in visited or path == '/':
+                continue
+            visited.add(path)
+
+            full_url = self.origin + route if route.startswith('/') else route
+            self._log(f"[{count+1:03d}] {route[:80]}", "dim")
+
+            try:
+                await page.goto(full_url, wait_until='domcontentloaded', timeout=12000)
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=6000)
+                except:
+                    pass
+                await page.wait_for_timeout(1200)
+
+                # Light interaction on each page
+                await page.evaluate('''async () => {
+                    for (let i = 0; i < 5; i++) { window.scrollBy(0, 400); await new Promise(r => setTimeout(r, 200)); }
+                }''')
+                await page.wait_for_timeout(500)
+
+                count += 1
+            except:
+                pass
+
+        self._log(f"Visited {count} routes, total intercepted: {len(self.intercepted)}", "ok")
+
+    # ── Phase 5: Build final URL list ────────────────────────────────────────
+
+    def _phase5_build_urls(self):
+        """Build final deduped URL list — ONE url per route+param structure"""
+        print(f"\n  {C.BOLD}{C.Y}═══ Phase 5: Build Complete URLs (dedup) ═══{C.END}\n")
+
+        seen_sigs = set()
+
+        def _add(method, url, extra=None):
+            parsed = urlparse(url)
+            pkeys = sorted(parse_qs(parsed.query, keep_blank_values=True).keys())
+            sig = self._sig(method, parsed.path, pkeys)
+            if sig in seen_sigs:
+                return
+            seen_sigs.add(sig)
+
+            entry = {
+                'url': url, 'method': method, 'path': parsed.path,
+                'query_params': {k: v[0] if len(v) == 1 else v
+                                for k, v in parse_qs(parsed.query, keep_blank_values=True).items()},
+                **(extra or {}),
+            }
+            if method == 'GET':
+                self.get_endpoints[url] = entry
+            elif method == 'POST':
+                self.post_endpoints[url] = entry
+            else:
+                self.other_endpoints[url] = entry
+
+        # 1. Network intercepted requests
+        for req in self.intercepted:
             url = req['url']
             method = req['method']
-            if not self._is_same_scope(url):
-                continue
+            extra = {}
+            if req.get('post_data') and not str(req.get('post_data','')).startswith('<binary'):
+                extra['post_data'] = req['post_data']
+            _add(method, url, extra)
 
-            sig = self._url_signature(method, url)
-            if sig in self.seen_signatures:
-                continue
-            self.seen_signatures.add(sig)
+        # 2. Route + param pairs from JS analysis
+        for pair in self.route_param_pairs:
+            route = pair['route']
+            params = pair.get('params', {})
+            method = pair['method']
+            body_params = pair.get('body_params', [])
 
-            parsed = urlparse(url)
-            entry = {
-                'url': url,
-                'method': method,
-                'path': parsed.path,
-                'query_params': dict(parse_qs(parsed.query, keep_blank_values=True)),
-                'post_data': req.get('post_data'),
-                'source': 'network',
-            }
-
-            if method == 'GET':
-                self.get_endpoints[url] = entry
-            elif method == 'POST':
-                self.post_endpoints[url] = entry
+            if route.startswith('http'):
+                base = route.split('?')[0]
             else:
-                self.other_endpoints[url] = entry
+                base = self.origin + route.split('?')[0]
 
-        # 2. Process JS-extracted endpoints
-        for ep in self.js_extracted_endpoints:
-            url = ep['full_url']
-            method = ep['method']
-
-            if self.auth_params and '?' in url:
-                url += '&' + self.auth_params
-            elif self.auth_params:
-                url += '?' + self.auth_params
-
-            sig = self._url_signature(method, url)
-            if sig in self.seen_signatures:
-                continue
-            self.seen_signatures.add(sig)
-
-            parsed = urlparse(url)
-            entry = {
-                'url': url,
-                'method': method,
-                'path': ep['endpoint'],
-                'query_params': dict(parse_qs(parsed.query, keep_blank_values=True)),
-                'body_params': ep['params'].get('body', []),
-                'content_type': ep.get('content_type'),
-                'source': f"js:{ep['source_js']}",
-            }
-
-            if method == 'GET':
-                self.get_endpoints[url] = entry
-            elif method == 'POST':
-                self.post_endpoints[url] = entry
+            if params:
+                qs = urlencode(params)
+                url = f"{base}?{qs}"
             else:
-                self.other_endpoints[url] = entry
+                url = base
 
-        # 3. Process SPA routes as GET endpoints
-        expanded_routes = self._expand_routes_with_params()
-        for route in expanded_routes:
-            if route.startswith('/'):
-                url = self.origin + route
-            elif route.startswith('http'):
+            extra = {}
+            if body_params:
+                extra['body_params'] = body_params
+                extra['content_type'] = 'application/json'
+
+            _add(method, url, extra)
+
+        # 3. Raw routes without params (just the path)
+        for route in self.raw_routes:
+            if route.startswith('http'):
                 url = route
             else:
-                continue
+                url = self.origin + route
+            _add('GET', url)
 
-            if not self._is_same_scope(url):
-                continue
+        # 4. Raw API endpoints
+        for ep in self.raw_api_endpoints:
+            url = self.origin + ep if not ep.startswith('http') else ep
+            _add('GET', url)  # These often get reclassified from intercepted data
 
-            sig = self._url_signature('GET', url)
-            if sig in self.seen_signatures:
-                continue
-            self.seen_signatures.add(sig)
+        self._log(f"GET: {len(self.get_endpoints)}, POST: {len(self.post_endpoints)}, "
+                  f"OTHER: {len(self.other_endpoints)}", "ok")
 
-            parsed = urlparse(url)
-            entry = {
-                'url': url,
-                'method': 'GET',
-                'path': parsed.path + ('?' + parsed.query if parsed.query else ''),
-                'query_params': dict(parse_qs(parsed.query, keep_blank_values=True)),
-                'source': 'spa_route',
-            }
-            self.get_endpoints[url] = entry
-
-        # 4. Add all unique intercepted URLs that are in scope
-        for url in self.intercepted_urls:
-            if not self._is_same_scope(url):
-                continue
-            parsed = urlparse(url)
-            if any(parsed.path.endswith(ext) for ext in ('.js', '.css', '.png', '.jpg', '.svg', '.ico', '.woff')):
-                continue
-
-            sig = self._url_signature('GET', url)
-            if sig in self.seen_signatures:
-                continue
-            self.seen_signatures.add(sig)
-
-            entry = {
-                'url': url,
-                'method': 'GET',
-                'path': parsed.path,
-                'query_params': dict(parse_qs(parsed.query, keep_blank_values=True)),
-                'source': 'intercepted',
-            }
-            self.get_endpoints[url] = entry
-
-    # ─── cURL Generation ─────────────────────────────────────────────────────
-
-    def _sample_val(self, name):
-        n = name.lower()
-        if 'id' in n: return 1
-        if 'email' in n: return "test@example.com"
-        if 'pass' in n: return "Test123!"
-        if 'name' in n: return "test"
-        if 'page' in n: return 1
-        if 'limit' in n or 'size' in n: return 20
-        if 'type' in n: return "default"
-        if 'token' in n: return "TOKEN_HERE"
-        return f"test_{name}"
+    # ── cURL + Save ──────────────────────────────────────────────────────────
 
     def _make_curl(self, entry, verbose=False):
         url = entry['url']
@@ -921,207 +989,160 @@ class EndpointHunter:
         if method in ('POST', 'PUT', 'PATCH'):
             ct = entry.get('content_type', 'application/json')
             cmd += f' \\\n  -H "Content-Type: {ct}"'
-
-            post_data = entry.get('post_data')
-            body_params = entry.get('body_params', [])
-
-            if post_data and not post_data.startswith('<binary'):
-                # Escape single quotes in post data
-                safe_data = post_data.replace("'", "'\\''")
-                cmd += f" \\\n  -d '{safe_data}'"
-            elif body_params:
-                body = {p: self._sample_val(p) for p in body_params}
+            pd = entry.get('post_data')
+            bp = entry.get('body_params', [])
+            if pd:
+                safe = pd.replace("'", "'\\''")
+                cmd += f" \\\n  -d '{safe}'"
+            elif bp:
+                body = {p: self._guess_param_value(p) for p in bp}
                 cmd += f" \\\n  -d '{json.dumps(body)}'"
             else:
                 cmd += " \\\n  -d '{}'"
-
         return cmd
 
-    # ─── Save Results ────────────────────────────────────────────────────────
-
-    def _save_results(self):
+    def _save(self):
         od = self.output_dir
 
-        # ── GET endpoints (one URL per line) ──
+        # GET
         with open(os.path.join(od, "GET_endpoints.txt"), 'w') as f:
-            f.write(f"# GET Endpoints — {len(self.get_endpoints)} found\n")
+            f.write(f"# GET Endpoints — {len(self.get_endpoints)}\n")
             f.write(f"# Target: {self.target_url}\n")
-            f.write(f"# {datetime.now().isoformat()}\n")
-            f.write(f"# {'='*76}\n\n")
+            f.write(f"# {datetime.now().isoformat()}\n#\n\n")
             for url in sorted(self.get_endpoints.keys()):
                 f.write(f"{url}\n")
 
-        # ── POST endpoints ──
+        # POST
         with open(os.path.join(od, "POST_endpoints.txt"), 'w') as f:
-            f.write(f"# POST Endpoints — {len(self.post_endpoints)} found\n")
-            f.write(f"# Target: {self.target_url}\n")
-            f.write(f"# {datetime.now().isoformat()}\n")
-            f.write(f"# {'='*76}\n\n")
-            for url, entry in sorted(self.post_endpoints.items()):
+            f.write(f"# POST Endpoints — {len(self.post_endpoints)}\n")
+            f.write(f"# Target: {self.target_url}\n#\n\n")
+            for url, e in sorted(self.post_endpoints.items()):
                 f.write(f"{url}\n")
-                if entry.get('body_params'):
-                    f.write(f"  Body: {', '.join(entry['body_params'])}\n")
-                if entry.get('post_data') and not str(entry.get('post_data', '')).startswith('<binary'):
-                    f.write(f"  Data: {str(entry['post_data'])[:200]}\n")
-                if entry.get('content_type'):
-                    f.write(f"  Type: {entry['content_type']}\n")
+                if e.get('body_params'):
+                    f.write(f"  Body: {', '.join(e['body_params'])}\n")
+                if e.get('post_data') and not str(e.get('post_data','')).startswith('<binary'):
+                    f.write(f"  Data: {str(e['post_data'])[:300]}\n")
                 f.write("\n")
 
-        # ── OTHER endpoints ──
+        # OTHER
         if self.other_endpoints:
             with open(os.path.join(od, "OTHER_endpoints.txt"), 'w') as f:
                 f.write(f"# PUT/DELETE/PATCH — {len(self.other_endpoints)}\n\n")
-                for url, entry in sorted(self.other_endpoints.items()):
-                    f.write(f"[{entry['method']}] {url}\n")
+                for url, e in sorted(self.other_endpoints.items()):
+                    f.write(f"[{e['method']}] {url}\n")
 
-        # ── ALL endpoints combined ──
+        # ALL
         with open(os.path.join(od, "ALL_endpoints.txt"), 'w') as f:
-            f.write(f"# All Endpoints — {self.target_url}\n")
-            f.write(f"# GET: {len(self.get_endpoints)} | POST: {len(self.post_endpoints)} | OTHER: {len(self.other_endpoints)}\n\n")
+            f.write(f"# All Endpoints | GET: {len(self.get_endpoints)} POST: {len(self.post_endpoints)} OTHER: {len(self.other_endpoints)}\n\n")
+            for label, eps in [("GET", self.get_endpoints), ("POST", self.post_endpoints), ("OTHER", self.other_endpoints)]:
+                if eps:
+                    f.write(f"# ── {label} ({len(eps)}) ──\n")
+                    for url, e in sorted(eps.items()):
+                        prefix = f"[{e['method']}] " if label == "OTHER" else ""
+                        f.write(f"{prefix}{url}\n")
+                    f.write("\n")
 
-            if self.get_endpoints:
-                f.write(f"# ── GET ({len(self.get_endpoints)}) ──\n")
-                for url in sorted(self.get_endpoints.keys()):
-                    f.write(f"{url}\n")
-                f.write("\n")
-
-            if self.post_endpoints:
-                f.write(f"# ── POST ({len(self.post_endpoints)}) ──\n")
-                for url in sorted(self.post_endpoints.keys()):
-                    f.write(f"{url}\n")
-                f.write("\n")
-
-            if self.other_endpoints:
-                f.write(f"# ── OTHER ({len(self.other_endpoints)}) ──\n")
-                for url, entry in sorted(self.other_endpoints.items()):
-                    f.write(f"[{entry['method']}] {url}\n")
-
-        # ── SPA Routes (raw) ──
+        # SPA routes
         with open(os.path.join(od, "SPA_routes.txt"), 'w') as f:
-            f.write(f"# Client-Side (SPA) Routes Discovered — {len(self.spa_routes)}\n")
-            f.write(f"# These are Vue/Nuxt/React router paths found in JS bundles\n\n")
-            for route in sorted(self.spa_routes):
-                f.write(f"{self.origin}{route}\n")
+            f.write(f"# SPA Routes — {len(self.raw_routes)}\n\n")
+            for r in sorted(self.raw_routes):
+                f.write(f"{self.origin}{r}\n")
 
-        # ── cURL GET ──
-        curl_get = os.path.join(od, "curl_GET.sh")
-        with open(curl_get, 'w') as f:
-            f.write("#!/bin/bash\n")
-            f.write(f"# GET endpoint verification — {len(self.get_endpoints)} endpoints\n")
-            f.write('# Run: bash curl_GET.sh 2>/dev/null\n\n')
-            for url, entry in sorted(self.get_endpoints.items()):
-                curl = self._make_curl(entry)
-                f.write(f"echo \"[GET] {entry.get('path', url[:80])}\"\n")
-                f.write(f"{curl}\n")
-                f.write('echo ""\n\n')
-        os.chmod(curl_get, 0o755)
+        # curl GET
+        p = os.path.join(od, "curl_GET.sh")
+        with open(p, 'w') as f:
+            f.write("#!/bin/bash\n# GET verification\n\n")
+            for url, e in sorted(self.get_endpoints.items()):
+                f.write(f"echo \"[GET] {e.get('path', url[:80])}\"\n{self._make_curl(e)}\necho \"\"\n\n")
+        os.chmod(p, 0o755)
 
-        # ── cURL POST ──
-        curl_post = os.path.join(od, "curl_POST.sh")
-        with open(curl_post, 'w') as f:
-            f.write("#!/bin/bash\n")
-            f.write(f"# POST endpoint verification — {len(self.post_endpoints)} endpoints\n\n")
-            for url, entry in sorted(self.post_endpoints.items()):
-                curl = self._make_curl(entry)
-                f.write(f"echo \"[POST] {entry.get('path', url[:80])}\"\n")
-                f.write(f"{curl}\n")
-                f.write('echo ""\n\n')
-        os.chmod(curl_post, 0o755)
+        # curl POST
+        p = os.path.join(od, "curl_POST.sh")
+        with open(p, 'w') as f:
+            f.write("#!/bin/bash\n# POST verification\n\n")
+            for url, e in sorted(self.post_endpoints.items()):
+                f.write(f"echo \"[POST] {e.get('path', url[:80])}\"\n{self._make_curl(e)}\necho \"\"\n\n")
+        os.chmod(p, 0o755)
 
-        # ── cURL ALL verbose ──
-        curl_all = os.path.join(od, "curl_ALL_verbose.sh")
-        with open(curl_all, 'w') as f:
-            f.write("#!/bin/bash\n")
-            f.write("# All endpoints — verbose cURL for verification\n\n")
-            all_entries = list(self.get_endpoints.items()) + \
-                          list(self.post_endpoints.items()) + \
-                          list(self.other_endpoints.items())
-            for url, entry in sorted(all_entries, key=lambda x: x[0]):
-                f.write(f"# [{entry['method']}] {entry.get('path', '')}\n")
-                f.write(f"{self._make_curl(entry, verbose=True)}\n\n")
-        os.chmod(curl_all, 0o755)
+        # curl ALL verbose
+        p = os.path.join(od, "curl_ALL_verbose.sh")
+        with open(p, 'w') as f:
+            f.write("#!/bin/bash\n# All — verbose\n\n")
+            all_e = list(self.get_endpoints.items()) + list(self.post_endpoints.items()) + list(self.other_endpoints.items())
+            for url, e in sorted(all_e, key=lambda x: x[0]):
+                f.write(f"# [{e['method']}] {e.get('path','')}\n{self._make_curl(e, verbose=True)}\n\n")
+        os.chmod(p, 0o755)
 
-        # ── Secrets ──
-        if self.js_extracted_secrets:
-            unique = []
-            seen = set()
-            for s in self.js_extracted_secrets:
-                key = (s['type'], s['value'])
+        # API calls
+        with open(os.path.join(od, "API_calls.txt"), 'w') as f:
+            seen = OrderedDict()
+            for key, count in self.api_log_seen.items():
                 if key not in seen:
-                    seen.add(key)
+                    seen[key] = count
+            f.write(f"# API Calls (unique) — {len(seen)}\n\n")
+            for key, count in seen.items():
+                f.write(f"{key} (×{count})\n")
+
+        # Secrets
+        if self.secrets:
+            unique = []
+            seen_s = set()
+            for s in self.secrets:
+                key = (s['type'], s['value'])
+                if key not in seen_s:
+                    seen_s.add(key)
                     unique.append(s)
-
             with open(os.path.join(od, "SECRETS.txt"), 'w') as f:
-                f.write(f"# Secrets Found: {len(unique)}\n\n")
+                f.write(f"# Secrets: {len(unique)}\n\n")
                 for s in unique:
-                    f.write(f"[{s['type']}] {s['value']}\n  File: {s['file']}\n  Context: {s['context'][:200]}\n\n")
-
+                    f.write(f"[{s['type']}] {s['value']}\n  {s['file']}\n  {s['context'][:200]}\n\n")
             with open(os.path.join(od, "SECRETS.json"), 'w') as f:
                 json.dump(unique, f, indent=2)
 
-        # ── JS files list ──
+        # JS files
         with open(os.path.join(od, "JS_files.txt"), 'w') as f:
-            f.write(f"# JS Files: {len(self.js_files)}\n\n")
-            for u in sorted(self.js_files):
-                dl = "✓" if u in self.js_content_cache else "✗"
+            f.write(f"# JS: {len(self.js_urls)} ({len(self.js_content)} downloaded)\n\n")
+            for u in sorted(self.js_urls):
+                dl = "✓" if u in self.js_content else "✗"
                 f.write(f"[{dl}] {u}\n")
 
-        # ── API calls observed (deduped) ──
-        with open(os.path.join(od, "API_calls.txt"), 'w') as f:
-            seen_api = OrderedDict()
-            for call in self.api_calls:
-                key = f"{call['method']} {call['url']}"
-                if key not in seen_api:
-                    seen_api[key] = call
-
-            f.write(f"# Unique API Calls (JSON responses) — {len(seen_api)}\n\n")
-            for key, call in seen_api.items():
-                f.write(f"[{call['method']}] [{call['status']}] {call['url']}\n")
-
-        # ── Postman collection ──
+        # Postman
         postman = {
-            "info": {
-                "name": f"EndpointHunter - {self.netloc}",
-                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-            },
+            "info": {"name": f"Hunt-{self.netloc}", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
             "item": []
         }
-        for method, endpoints in [("GET", self.get_endpoints), ("POST", self.post_endpoints)]:
-            folder = {"name": method, "item": []}
-            for url, entry in sorted(endpoints.items()):
-                item = {"name": entry.get('path', url[:60]), "request": {"method": method, "url": url}}
-                if method == 'POST':
-                    item['request']['header'] = [{"key": "Content-Type", "value": entry.get('content_type', 'application/json')}]
-                    pd = entry.get('post_data')
-                    bp = entry.get('body_params', [])
+        for label, eps in [("GET", self.get_endpoints), ("POST", self.post_endpoints)]:
+            folder = {"name": label, "item": []}
+            for url, e in sorted(eps.items()):
+                item = {"name": e.get('path', url[:60]), "request": {"method": label, "url": url}}
+                if label == 'POST':
+                    item['request']['header'] = [{"key": "Content-Type", "value": e.get('content_type', 'application/json')}]
+                    bp = e.get('body_params', [])
+                    pd = e.get('post_data')
                     if pd and not str(pd).startswith('<binary'):
                         item['request']['body'] = {"mode": "raw", "raw": pd}
                     elif bp:
-                        item['request']['body'] = {"mode": "raw", "raw": json.dumps({p: self._sample_val(p) for p in bp})}
+                        item['request']['body'] = {"mode": "raw", "raw": json.dumps({p: self._guess_param_value(p) for p in bp})}
                 folder['item'].append(item)
             postman['item'].append(folder)
-
         with open(os.path.join(od, "postman_collection.json"), 'w') as f:
             json.dump(postman, f, indent=2)
 
-        # ── Summary ──
-        n_secrets = len(set((s['type'], s['value']) for s in self.js_extracted_secrets))
+        # Summary
+        n_sec = len(set((s['type'], s['value']) for s in self.secrets))
         with open(os.path.join(od, "SUMMARY.txt"), 'w') as f:
-            f.write(f"{'='*80}\n EndpointHunter v3.0 Scan Summary\n{'='*80}\n")
-            f.write(f" Target:          {self.target_url}\n")
-            f.write(f" Date:            {datetime.now().isoformat()}\n")
-            f.write(f" Pages Visited:   {len(self.visited_pages)}\n")
-            f.write(f" SPA Routes:      {len(self.spa_routes)}\n")
-            f.write(f" GET endpoints:   {len(self.get_endpoints)}\n")
-            f.write(f" POST endpoints:  {len(self.post_endpoints)}\n")
-            f.write(f" OTHER endpoints: {len(self.other_endpoints)}\n")
-            f.write(f" JS files:        {len(self.js_files)} ({len(self.js_content_cache)} downloaded)\n")
-            f.write(f" Secrets:         {n_secrets}\n")
-            f.write(f" Network reqs:    {len(self.intercepted_requests)}\n")
-            f.write(f" API calls:       {len(self.api_calls)}\n")
-            f.write(f"{'='*80}\n")
+            f.write(f"{'='*60}\n EndpointHunter v4.0\n{'='*60}\n")
+            f.write(f" Target:     {self.target_url}\n")
+            f.write(f" Date:       {datetime.now().isoformat()}\n")
+            f.write(f" GET:        {len(self.get_endpoints)}\n")
+            f.write(f" POST:       {len(self.post_endpoints)}\n")
+            f.write(f" OTHER:      {len(self.other_endpoints)}\n")
+            f.write(f" SPA routes: {len(self.raw_routes)}\n")
+            f.write(f" JS files:   {len(self.js_urls)} ({len(self.js_content)} dl)\n")
+            f.write(f" Secrets:    {n_sec}\n")
+            f.write(f"{'='*60}\n")
 
-    # ─── Main Execution ──────────────────────────────────────────────────────
+    # ── Main ─────────────────────────────────────────────────────────────────
 
     async def run(self):
         start = datetime.now()
@@ -1129,7 +1150,6 @@ class EndpointHunter:
 
         print(f"  {C.BOLD}Target:{C.END}    {self.target_url}")
         print(f"  {C.BOLD}Depth:{C.END}     {self.max_depth}")
-        print(f"  {C.BOLD}Max Pages:{C.END} {self.max_pages}")
         print(f"  {C.BOLD}Output:{C.END}    {self.output_dir}/")
 
         async with async_playwright() as p:
@@ -1144,204 +1164,83 @@ class EndpointHunter:
                 viewport={'width': 1920, 'height': 1080},
             )
             page = await context.new_page()
-
-            # Hook network interception
             page.on('request', self._on_request)
             page.on('response', self._on_response)
 
-            # ══════════════════════════════════════════════════════════════
-            # Phase 1: Initial page load + deep interaction
-            # ══════════════════════════════════════════════════════════════
-            print(f"\n  {C.BOLD}{C.Y}═══ Phase 1: Initial Load + Deep Interaction ═══{C.END}\n")
-
-            try:
-                await page.goto(self.target_url, wait_until='domcontentloaded', timeout=self.timeout * 1000)
-                try:
-                    await page.wait_for_load_state('networkidle', timeout=15000)
-                except:
-                    pass
-                await page.wait_for_timeout(3000)
-            except Exception as e:
-                self._log(f"Initial load error: {e}", "err")
-
-            self.visited_pages.add(self.target_url)
-
-            # Deep interact with homepage
-            self._log("Interacting with homepage (clicking tabs, scrolling, pagination)...")
-            await self._deep_interact(page)
-
-            # Extract links
-            links = await self._extract_all_links(page)
-            for link in links:
-                if self._is_same_scope(link):
-                    parsed = urlparse(link)
-                    if parsed.path and parsed.path != '/':
-                        self.spa_routes.add(parsed.path + ('?' + parsed.query if parsed.query else ''))
-
-            self._log(f"Network requests captured: {len(self.intercepted_requests)}", "ok")
-            self._log(f"SPA routes found: {len(self.spa_routes)}", "ok")
-            self._log(f"JS files found: {len(self.js_files)}", "ok")
-
-            # ══════════════════════════════════════════════════════════════
-            # Phase 2: Fetch Nuxt/Vue manifest & download ALL JS
-            # ══════════════════════════════════════════════════════════════
-            print(f"\n  {C.BOLD}{C.Y}═══ Phase 2: JS Discovery & Download ═══{C.END}\n")
-
-            # Try Nuxt manifest
-            await self._fetch_nuxt_manifest(page)
-
-            # Also grab all JS from intercepted requests
-            for req in self.intercepted_requests:
-                url = req['url']
-                parsed = urlparse(url)
-                if parsed.path.endswith('.js') and self._is_same_scope(url):
-                    self.js_files.add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')))
-
-            # Recursive JS download & analysis
-            for pass_num in range(1, 6):
-                initial_count = len(self.js_files)
-                await self._download_js_files(page)
-
-                to_analyze = [u for u in self.js_content_cache if u not in self.analyzed_js]
-                total_eps = 0
-                for url in to_analyze:
-                    n = self._analyze_js_content(url, self.js_content_cache[url])
-                    total_eps += n
-
-                new_js = len(self.js_files) - initial_count
-                self._log(f"Pass {pass_num}: analyzed {len(to_analyze)} JS, "
-                          f"found {total_eps} endpoints, {len(self.spa_routes)} routes, "
-                          f"{new_js} new JS refs", "info")
-
-                if new_js == 0:
-                    self._log("No more JS files to discover ✓", "ok")
-                    break
-
-            # ══════════════════════════════════════════════════════════════
-            # Phase 3: Visit discovered SPA routes
-            # ══════════════════════════════════════════════════════════════
-            print(f"\n  {C.BOLD}{C.Y}═══ Phase 3: Visiting SPA Routes ═══{C.END}\n")
-
-            # Navigate back to homepage first
-            try:
-                await page.goto(self.target_url, wait_until='domcontentloaded', timeout=15000)
-                await page.wait_for_timeout(2000)
-            except:
-                pass
-
-            # Visit key SPA routes to trigger their API calls
-            routes_to_visit = sorted(self.spa_routes)
-            # Prioritize interesting routes
-            priority_keywords = ['all', 'game', 'slot', 'live', 'sport', 'vip', 'promotion',
-                                 'help', 'detail', 'user', 'account', 'wallet', 'deposit',
-                                 'withdraw', 'history', 'record', 'rank', 'agent', 'referral']
-            priority_routes = [r for r in routes_to_visit
-                              if any(kw in r.lower() for kw in priority_keywords)]
-            other_routes = [r for r in routes_to_visit if r not in priority_routes]
-            ordered_routes = priority_routes + other_routes
-
-            visited_count = 0
-            for route in ordered_routes[:100]:  # Cap at 100 SPA routes
-                if visited_count >= self.max_pages:
-                    break
-
-                full_url = self.origin + route if route.startswith('/') else route
-                if full_url in self.visited_pages:
-                    continue
-
-                self._log(f"[{visited_count+1:03d}] Visiting: {route[:80]}", "dim")
-                await self._navigate_spa_route(page, route)
-                visited_count += 1
-
-            self._log(f"Visited {visited_count} SPA routes", "ok")
-            self._log(f"Total network requests: {len(self.intercepted_requests)}", "ok")
+            await self._phase1_load_and_intercept(page)
+            await self._phase2_download_all_js(page)
+            self._phase3_analyze_js()
+            await self._phase4_visit_routes(page)
+            self._phase5_build_urls()
 
             await browser.close()
 
-        # ══════════════════════════════════════════════════════════════
-        # Phase 4: Process & Save
-        # ══════════════════════════════════════════════════════════════
-        print(f"\n  {C.BOLD}{C.Y}═══ Phase 4: Processing & Saving ═══{C.END}\n")
-        self._process_all()
-        self._save_results()
+        self._save()
 
         elapsed = datetime.now() - start
-        n_secrets = len(set((s['type'], s['value']) for s in self.js_extracted_secrets))
+        n_sec = len(set((s['type'], s['value']) for s in self.secrets))
 
         print(f"""
   {C.BOLD}{C.G}{'═'*60}
   SCAN COMPLETE
   {'═'*60}{C.END}
-  {C.W}Output:          {C.CY}{self.output_dir}/{C.END}
-  {C.W}Pages Visited:   {C.G}{len(self.visited_pages)}{C.END}
-  {C.W}SPA Routes:      {C.G}{len(self.spa_routes)}{C.END}
-  {C.W}Network Reqs:    {C.G}{len(self.intercepted_requests)}{C.END}
-  {C.W}API Calls:       {C.M}{len(self.api_calls)}{C.END}
-  {C.W}JS Files:        {C.G}{len(self.js_files)} ({len(self.js_content_cache)} downloaded){C.END}
-  {C.W}GET Endpoints:   {C.G}{len(self.get_endpoints)}{C.END}
-  {C.W}POST Endpoints:  {C.R}{len(self.post_endpoints)}{C.END}
-  {C.W}OTHER Endpoints: {C.Y}{len(self.other_endpoints)}{C.END}
-  {C.W}Secrets:         {C.R}{n_secrets}{C.END}
-  {C.W}Time:            {C.CY}{elapsed}{C.END}
+  {C.W}Output:       {C.CY}{self.output_dir}/{C.END}
+  {C.W}GET:          {C.G}{len(self.get_endpoints)}{C.END}
+  {C.W}POST:         {C.R}{len(self.post_endpoints)}{C.END}
+  {C.W}OTHER:        {C.Y}{len(self.other_endpoints)}{C.END}
+  {C.W}SPA Routes:   {C.G}{len(self.raw_routes)}{C.END}
+  {C.W}JS Files:     {C.G}{len(self.js_content)}/{len(self.js_urls)}{C.END}
+  {C.W}Secrets:      {C.R}{n_sec}{C.END}
+  {C.W}Time:         {C.CY}{elapsed}{C.END}
   {C.BOLD}{C.G}{'═'*60}{C.END}
 
   {C.BOLD}Files:{C.END}
-  {C.DIM}├── GET_endpoints.txt       — GET URLs (one per line)
-  ├── POST_endpoints.txt      — POST URLs + params + body
-  ├── OTHER_endpoints.txt     — PUT/DELETE/PATCH
-  ├── ALL_endpoints.txt       — Everything combined
-  ├── SPA_routes.txt          — Client-side routes from JS
-  ├── API_calls.txt           — Observed JSON API calls
-  ├── curl_GET.sh             — cURL verify GET
-  ├── curl_POST.sh            — cURL verify POST
-  ├── curl_ALL_verbose.sh     — Verbose cURL all
-  ├── postman_collection.json — Import to Postman/Burp
-  ├── SECRETS.txt / .json     — Leaked secrets
-  ├── JS_files.txt            — JS file inventory
-  ├── SUMMARY.txt             — Scan summary
-  └── js_files/               — Downloaded JS source{C.END}
+  {C.DIM}├── GET_endpoints.txt       — One URL per line
+  ├── POST_endpoints.txt      — POST + body params
+  ├── ALL_endpoints.txt       — Combined
+  ├── SPA_routes.txt          — Client routes from JS
+  ├── API_calls.txt           — Observed API calls
+  ├── curl_GET.sh / curl_POST.sh / curl_ALL_verbose.sh
+  ├── postman_collection.json
+  ├── SECRETS.txt / .json
+  ├── JS_files.txt
+  └── js_files/               — Downloaded JS{C.END}
 """)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='EndpointHunter v3.0 — SPA-Aware Endpoint Discovery',
+        description='EndpointHunter v4.0 — Chunk-First SPA Endpoint Discovery',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 endpoint_hunter.py https://mgc88.cc/
-  python3 endpoint_hunter.py https://target.com -d 15 -v
-  python3 endpoint_hunter.py https://target.com --auth "token=abc" --max-pages 1000
+  python3 endpoint_hunter_v4.py https://mgc88.cc/
+  python3 endpoint_hunter_v4.py https://target.com -d 15 -v
+  python3 endpoint_hunter_v4.py https://target.com --auth "token=abc"
 
-Key improvements over v2:
-  ✓ SPA-aware (Nuxt/Vue/React) — extracts client-side routes from JS bundles
+Key changes in v4:
+  ✓ Downloads ALL JS chunks (including from CDN domains like cdn360-pc-h5.w0zuv.live)
+  ✓ Pairs routes with their query params from JS context
+  ✓ Builds complete URLs: /all?type=IsNew&page=1, /detail/helpCenter?id=1
+  ✓ ONE URL per route+param structure (strict dedup)
   ✓ Visits discovered SPA routes to trigger API calls
-  ✓ Clicks tabs, filters, pagination to discover dynamic endpoints
-  ✓ Fixed binary post_data crash (UnicodeDecodeError)
-  ✓ Nuxt manifest parsing for complete route & chunk discovery
-  ✓ API_calls.txt — all JSON API responses observed
-  ✓ SPA_routes.txt — client-side routes extracted from JS
+  ✓ No duplicate log spam
         """
     )
 
     parser.add_argument('url', help='Target URL')
     parser.add_argument('-d', '--depth', type=int, default=10, help='Max depth (default: 10)')
-    parser.add_argument('--auth', help='Auth query params (e.g., "uid=123&key=abc")')
+    parser.add_argument('--auth', help='Auth params (e.g., "uid=123&key=abc")')
     parser.add_argument('-v', '--verbose', action='store_true')
-    parser.add_argument('--max-pages', type=int, default=500, help='Max pages (default: 500)')
+    parser.add_argument('--max-pages', type=int, default=300, help='Max SPA routes to visit (default: 300)')
     parser.add_argument('--timeout', type=int, default=60, help='Timeout secs (default: 60)')
-    parser.add_argument('--show-browser', action='store_true', help='Show browser')
+    parser.add_argument('--show-browser', action='store_true')
 
     args = parser.parse_args()
-
     scanner = EndpointHunter(
-        target_url=args.url,
-        max_depth=args.depth,
-        auth_params=args.auth,
-        verbose=args.verbose,
-        headless=not args.show_browser,
-        timeout=args.timeout,
-        max_pages=args.max_pages,
+        target_url=args.url, max_depth=args.depth, auth_params=args.auth,
+        verbose=args.verbose, headless=not args.show_browser,
+        timeout=args.timeout, max_pages=args.max_pages,
     )
     asyncio.run(scanner.run())
 
