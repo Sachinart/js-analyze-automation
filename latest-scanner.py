@@ -156,6 +156,10 @@ class EndpointHunter:
         if not url.startswith("http"):
             return
 
+        # ── Skip out-of-scope domains (CDN, analytics, third-party) ──
+        if not self._is_same_scope(url):
+            return
+
         # Skip static assets
         parsed = urlparse(url)
         skip_ext = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff',
@@ -195,16 +199,39 @@ class EndpointHunter:
         self.intercepted_urls.add(url)
 
     def _on_response(self, response):
-        """Track API (JSON) responses"""
+        """Track API (JSON) responses — deduped, in-scope only"""
         try:
+            url = response.url
+            method = response.request.method.upper()
+
+            # Skip out-of-scope domains
+            if not self._is_same_scope(url):
+                return
+
             content_type = response.headers.get('content-type', '')
             if 'application/json' in content_type:
+                # Dedup key: method + URL (ignore query param values, keep keys)
+                parsed = urlparse(url)
+                param_keys = "&".join(sorted(parse_qs(parsed.query).keys()))
+                dedup_key = f"{method}:{parsed.netloc}{parsed.path}?{param_keys}"
+
+                if not hasattr(self, '_api_log_seen'):
+                    self._api_log_seen = {}
+
+                count = self._api_log_seen.get(dedup_key, 0)
+                self._api_log_seen[dedup_key] = count + 1
+
                 self.api_calls.append({
-                    'url': response.url,
-                    'method': response.request.method.upper(),
+                    'url': url,
+                    'method': method,
                     'status': response.status,
                 })
-                self._vlog(f"[API] {response.request.method} {response.url}")
+
+                # Only print first 2 occurrences, then suppress
+                if count < 2:
+                    self._vlog(f"[API] {method} {url}")
+                elif count == 2:
+                    self._vlog(f"[API] {method} {url} (suppressing further duplicates)")
         except Exception:
             pass
 
@@ -1039,15 +1066,17 @@ class EndpointHunter:
                 dl = "✓" if u in self.js_content_cache else "✗"
                 f.write(f"[{dl}] {u}\n")
 
-        # ── API calls observed ──
+        # ── API calls observed (deduped) ──
         with open(os.path.join(od, "API_calls.txt"), 'w') as f:
-            f.write(f"# API Calls (JSON responses) — {len(self.api_calls)}\n\n")
-            seen_api = set()
+            seen_api = OrderedDict()
             for call in self.api_calls:
                 key = f"{call['method']} {call['url']}"
                 if key not in seen_api:
-                    seen_api.add(key)
-                    f.write(f"[{call['method']}] [{call['status']}] {call['url']}\n")
+                    seen_api[key] = call
+
+            f.write(f"# Unique API Calls (JSON responses) — {len(seen_api)}\n\n")
+            for key, call in seen_api.items():
+                f.write(f"[{call['method']}] [{call['status']}] {call['url']}\n")
 
         # ── Postman collection ──
         postman = {
